@@ -98,7 +98,9 @@ class GrammarManager:
                     if isinstance(
                         value, InvalidGrammarObject
                     ):  # We hit a cached invalid grammar.
-                        error_msg = f"Invalid grammar request with cache hit: {key=}. Error: {value.error_message}"
+                        error_msg = (
+                            f"Failed to compile {key[0]} grammar: {value.error_message}"
+                        )
                         req.set_finish_with_abort(error_msg)
 
         if add_to_grammar_queue:
@@ -175,7 +177,7 @@ class GrammarManager:
             req.grammar = req.grammar.result()
             self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
             if isinstance(req.grammar, InvalidGrammarObject):
-                error_msg = f"Invalid grammar request: {req.grammar_key=}. Error: {req.grammar.error_message}"
+                error_msg = f"Failed to compile {req.grammar_key[0]} grammar: {req.grammar.error_message}"
                 req.set_finish_with_abort(error_msg)
 
         # Return failed requests
