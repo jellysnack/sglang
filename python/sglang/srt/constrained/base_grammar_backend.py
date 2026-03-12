@@ -128,9 +128,6 @@ class InvalidGrammarObject(BaseGrammarObject):
         return f"InvalidGrammarObject(error_message={self.error_message!r})"
 
 
-INVALID_GRAMMAR_OBJ = InvalidGrammarObject()
-
-
 @dataclass
 class CacheEntry:
     value: BaseGrammarObject
