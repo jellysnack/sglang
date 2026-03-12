@@ -117,7 +117,18 @@ class BaseGrammarObject:
         raise NotImplementedError()
 
 
-INVALID_GRAMMAR_OBJ = BaseGrammarObject()
+class InvalidGrammarObject(BaseGrammarObject):
+    """Represents a grammar that failed to compile, carrying the original error message."""
+
+    def __init__(self, error_message: str = "Unknown grammar error"):
+        super().__init__()
+        self.error_message = error_message
+
+    def __repr__(self):
+        return f"InvalidGrammarObject(error_message={self.error_message!r})"
+
+
+INVALID_GRAMMAR_OBJ = InvalidGrammarObject()
 
 
 @dataclass
