@@ -125,7 +125,7 @@ class GuidanceGrammar(BaseGrammarObject):
 
     def _check_err(self) -> None:
         if self.ll_matcher.is_error():
-            raise ValueError({self.ll_matcher.get_error()})
+            raise ValueError(self.ll_matcher.get_error())
 
 
 class GuidanceBackend(BaseGrammarBackend):
