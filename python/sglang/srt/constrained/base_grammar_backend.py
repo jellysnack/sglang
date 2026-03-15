@@ -134,7 +134,7 @@ class BaseGrammarBackend:
 
     def _not_supported(self, key_type: str, key_string: str) -> BaseGrammarObject:
         logger.warning(f"Skip unsupported {key_type=}, {key_string=}")
-        return INVALID_GRAMMAR_OBJ
+        return InvalidGrammarObject()
 
     def dispatch_fallback(self, key_type: str, key_string: str) -> BaseGrammarObject:
         """
