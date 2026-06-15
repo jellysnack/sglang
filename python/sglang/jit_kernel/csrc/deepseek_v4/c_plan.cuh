@@ -25,6 +25,8 @@ using RID_T = int64_t;
 using R2T_T = int32_t;
 using F2S_T = int64_t;
 using IDX_T = int64_t;
+using SWA_LOC_T = int32_t;
+using START_T = int32_t;
 
 /// NOTE: for the internal use, we pack the ragged and batch id, since both not exceed 65536
 SGL_DEVICE __host__ PlanW pack_w(uint32_t ragged_id, uint32_t batch_id, int32_t seq_len) {
@@ -53,9 +55,11 @@ struct Prefill0Params {
 struct Prefill1Params {
   PlanC* plan_c;
   PlanW* plan_w;
-  const RID_T* rid_ptr;  // [batch_size]
-  const R2T_T* r2t_ptr;  // [num_reqs, stride_r2t]
-  const F2S_T* f2s_ptr;  // [num_swa_slots]
+  const RID_T* rid_ptr;                 // [batch_size]
+  const R2T_T* r2t_ptr;                 // [num_reqs, stride_r2t]
+  const F2S_T* f2s_ptr;                 // [num_swa_slots]
+  const SWA_LOC_T* swa_override_ptr;    // [num_q_tokens] or nullptr
+  const START_T* extend_start_loc_ptr;  // [batch_size] or nullptr
   int64_t stride_r2t;
   uint32_t num_c;
   uint32_t num_w;
@@ -304,6 +308,7 @@ __global__ void plan_compress_prefill_kernel_1(const Prefill1Params params) {
     const auto ring_offset = swa_loc % params.ring_size;
     return swa_page * params.ring_size + ring_offset;
   };
+  const auto has_swa_override = params.swa_override_ptr != nullptr;
 
   if (!plan_c.is_invalid()) {  // 1. in bound. 2. not masked
     if (plan_c.buffer_len > 0) {
@@ -316,8 +321,13 @@ __global__ void plan_compress_prefill_kernel_1(const Prefill1Params params) {
       const auto position_0 = max(position_1 - params.compress_ratio, 0);
       const auto raw_loc_0 = mapping[position_0];
       const auto raw_loc_1 = mapping[position_1];
-      const auto swa_loc_0 = params.f2s_ptr[raw_loc_0];
-      const auto swa_loc_1 = params.f2s_ptr[raw_loc_1];
+      const auto ragged_id = static_cast<int32_t>(plan_c.ragged_id);
+      const auto local_j = has_swa_override ? ragged_id - params.extend_start_loc_ptr[batch_id] : -1;
+      const auto swa_loc_0 = (has_swa_override && local_j >= params.compress_ratio)
+                                 ? params.swa_override_ptr[ragged_id - params.compress_ratio]
+                                 : static_cast<int32_t>(params.f2s_ptr[raw_loc_0]);
+      const auto swa_loc_1 =
+          has_swa_override ? params.swa_override_ptr[ragged_id] : static_cast<int32_t>(params.f2s_ptr[raw_loc_1]);
       plan_c.read_page_0 = compute_loc(swa_loc_0) / params.compress_ratio;
       plan_c.read_page_1 = compute_loc(swa_loc_1) / params.compress_ratio;
       params.plan_c[idx] = plan_c;
@@ -333,7 +343,8 @@ __global__ void plan_compress_prefill_kernel_1(const Prefill1Params params) {
     // `seq_len` (`write_loc`) may not be aligned here
     const auto position = static_cast<int32_t>(plan_w.write_loc - 1);
     const auto raw_loc = mapping[position];
-    const auto swa_loc = params.f2s_ptr[raw_loc];
+    const auto swa_loc =
+        has_swa_override ? params.swa_override_ptr[ragged_id] : static_cast<int32_t>(params.f2s_ptr[raw_loc]);
     plan_w.ragged_id = ragged_id;
     plan_w.write_loc = compute_loc(swa_loc);
     params.plan_w[idx] = plan_w;
@@ -466,6 +477,8 @@ inline PrefillPlan plan_compress_prefill(
     const tvm::ffi::TensorView seq_lens,            // CPU/GPU
     const tvm::ffi::TensorView extend_lens,         // CPU/GPU
     const tvm::ffi::TensorView recompute_boundary,  // CPU/GPU [batch_size] or empty (=no suppression)
+    const tvm::ffi::TensorView swa_override,        // GPU [num_q_tokens] int32 or empty
+    const tvm::ffi::TensorView extend_start_loc,    // GPU [batch_size] int32 or empty
     const tvm::ffi::TensorView pin_buffer,          // CPU
     const uint32_t num_q_tokens,
     const int32_t compress_ratio,
@@ -497,6 +510,14 @@ inline PrefillPlan plan_compress_prefill(
       .verify(seq_lens)
       .verify(extend_lens);
   TensorMatcher({-1})  //
+      .with_dtype<SWA_LOC_T>()
+      .with_device(device_)
+      .verify(swa_override);
+  TensorMatcher({-1})  //
+      .with_dtype<START_T>()
+      .with_device(device_)
+      .verify(extend_start_loc);
+  TensorMatcher({-1})  //
       .with_dtype<uint8_t>()
       .with_device<kDLCPU>()
       .verify(pin_buffer);
@@ -508,6 +529,10 @@ inline PrefillPlan plan_compress_prefill(
   const auto ext_ptr = static_cast<const IDX_T*>(extend_lens.data_ptr());
   const auto rb_ptr =
       recompute_boundary.numel() > 0 ? static_cast<const IDX_T*>(recompute_boundary.data_ptr()) : nullptr;
+  const auto swa_override_ptr =
+      swa_override.numel() > 0 ? static_cast<const SWA_LOC_T*>(swa_override.data_ptr()) : nullptr;
+  const auto extend_start_loc_ptr =
+      extend_start_loc.numel() > 0 ? static_cast<const START_T*>(extend_start_loc.data_ptr()) : nullptr;
   const auto rid_ptr = static_cast<const RID_T*>(req_pool_indices.data_ptr());
   const auto r2t_ptr = static_cast<const R2T_T*>(req_to_token.data_ptr());
   const auto f2s_ptr = static_cast<const F2S_T*>(full_to_swa.data_ptr());
@@ -516,6 +541,9 @@ inline PrefillPlan plan_compress_prefill(
   constexpr auto kMaxTokens = static_cast<uint32_t>(std::numeric_limits<uint16_t>::max());
   RuntimeCheck(compress_ratio == 4 || compress_ratio == 128);
   RuntimeCheck(batch_size <= num_q_tokens && num_q_tokens <= kMaxTokens);
+  RuntimeCheck((swa_override_ptr == nullptr) == (extend_start_loc_ptr == nullptr));
+  RuntimeCheck(swa_override_ptr == nullptr || static_cast<uint32_t>(swa_override.numel()) >= num_q_tokens);
+  RuntimeCheck(extend_start_loc_ptr == nullptr || static_cast<uint32_t>(extend_start_loc.numel()) == batch_size);
   // `swa_page_size` >= `ring_size` >= `compress_ratio`
   RuntimeCheck(swa_page_size % ring_size == 0 && ring_size % compress_ratio == 0);
 
@@ -553,6 +581,8 @@ inline PrefillPlan plan_compress_prefill(
         .rid_ptr = rid_ptr,
         .r2t_ptr = r2t_ptr,
         .f2s_ptr = f2s_ptr,
+        .swa_override_ptr = swa_override_ptr,
+        .extend_start_loc_ptr = extend_start_loc_ptr,
         .stride_r2t = req_to_token.stride(0),
         .num_c = num_q_tokens,
         .num_w = num_q_tokens,
@@ -630,6 +660,8 @@ inline PrefillPlan plan_compress_prefill(
       .rid_ptr = rid_ptr,
       .r2t_ptr = r2t_ptr,
       .f2s_ptr = f2s_ptr,
+      .swa_override_ptr = swa_override_ptr,
+      .extend_start_loc_ptr = extend_start_loc_ptr,
       .stride_r2t = req_to_token.size(1),
       .num_c = counter_c,
       .num_w = counter_w,

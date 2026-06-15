@@ -129,13 +129,6 @@ class SWAComponent(TreeComponent):
             return False
         return node.component_data[self.component_type].value is None
 
-    def should_skip_lock_for_recompute(self, node: UnifiedTreeNode) -> bool:
-        """True iff inc/dec_lock_ref should skip the SWA walk."""
-        return (
-            envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.get()
-            and self.is_swa_recompute_tombstone(node)
-        )
-
     def revive_tombstoned_node(self, node: UnifiedTreeNode) -> None:
         """Flip a single recompute tombstone back to live."""
         ct = self.component_type
@@ -446,6 +439,8 @@ class SWAComponent(TreeComponent):
         self, params: EvictParams, tracker: dict[ComponentType, int]
     ) -> None:
         request = params.swa_num_tokens
+        if request <= 0:
+            return
         ct = self.component_type
         lru = self.cache.lru_lists[ct]
         recompute_mode = envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.get()
@@ -472,6 +467,8 @@ class SWAComponent(TreeComponent):
                     x, self, target=EvictLayer.DEVICE, tracker=tracker
                 )
                 self.cache._cascade_evict(x, self, tracker)
+                if not lru.in_list(x_next):
+                    x_next = lru.get_lru_no_lock()
                 x = x_next
 
     def acquire_component_lock(

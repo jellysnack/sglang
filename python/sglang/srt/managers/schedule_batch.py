@@ -1610,6 +1610,14 @@ def _compute_chunked_req_next_prompt_token(
 
 
 @dataclasses.dataclass
+class SWARecomputeTxn:
+    req: Req
+    recompute_len: int
+    full_indices: torch.Tensor
+    fresh_swa_indices: torch.Tensor
+
+
+@dataclasses.dataclass
 class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     """Store all information of a batch on the scheduler."""
 
@@ -1692,6 +1700,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # The output locations of the KV cache
     out_cache_loc: torch.Tensor = None  # shape: [b], int64
+    swa_out_cache_loc_override: Optional[torch.Tensor] = None
 
     # For hybrid GDN prefix cache
     mamba_track_indices: torch.Tensor = None  # shape: [b], int64
@@ -1731,6 +1740,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Per-req boundary P below which recompute suppresses compressed-KV writes.
     swa_recompute_boundaries: Optional[List[int]] = None
+    swa_recompute_txns: Optional[List[SWARecomputeTxn]] = None
 
     # Whether to return hidden states
     return_hidden_states: bool = False
@@ -1946,6 +1956,121 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
             req.logprob_start_len = max(req.logprob_start_len, encoder_len)
 
+    def _alloc_swa_recompute_windows(self, recompute_lens: List[int]) -> None:
+        allocator_sw = self.token_to_kv_pool_allocator
+        assert isinstance(
+            allocator_sw, SWATokenToKVPoolAllocator
+        ), "SWA-window recompute requires a SWATokenToKVPoolAllocator"
+
+        total_recompute_tokens = 0
+        for req, R in zip(self.reqs, recompute_lens):
+            if R <= 0:
+                continue
+            total_recompute_tokens += R
+
+        if total_recompute_tokens == 0:
+            return
+
+        # Recompute writes to private SWA pages first. Do all needed eviction
+        # before allocating those private pages; the global full->SWA mapping is
+        # committed only after forward finishes.
+        swa_avail_before_evict = allocator_sw.swa_attn_allocator.available_size()
+        if total_recompute_tokens > swa_avail_before_evict:
+            self.tree_cache.evict(
+                EvictParams(
+                    num_tokens=0,
+                    swa_num_tokens=total_recompute_tokens - swa_avail_before_evict,
+                )
+            )
+
+        swa_out_parts = []
+        txns: List[SWARecomputeTxn] = []
+        for req, R in zip(self.reqs, recompute_lens):
+            P = len(req.prefix_indices)
+            seq_len = req.fill_len
+            new_tokens = seq_len - P
+
+            if R > 0:
+                assert req.swa_prefix_lock_released, (
+                    "SWA-window recompute requires a FULL-only request lock "
+                    f"before allocating private SWA pages, rid={req.rid}"
+                )
+                window_full = req.prefix_indices[P - R : P]
+                fresh_swa = allocator_sw.alloc_fresh_swa_for_recompute_window(
+                    window_full
+                )
+                if fresh_swa is None:
+                    swa_avail_after_evict = (
+                        allocator_sw.swa_attn_allocator.available_size()
+                    )
+                    raise AssertionError(
+                        "SWA-window recompute: fresh SWA alloc failed despite "
+                        f"pre-check; R={R}, total_R={total_recompute_tokens}, "
+                        f"swa_avail_before_evict={swa_avail_before_evict}, "
+                        f"swa_avail_after_evict={swa_avail_after_evict}, "
+                        f"swa_evictable={self.tree_cache.swa_evictable_size()}, "
+                        f"page_size={allocator_sw.page_size}, rid={req.rid}"
+                    )
+                txns.append(
+                    SWARecomputeTxn(
+                        req=req,
+                        recompute_len=R,
+                        full_indices=window_full,
+                        fresh_swa_indices=fresh_swa,
+                    )
+                )
+                swa_out_parts.append(fresh_swa)
+
+            if new_tokens > 0:
+                assert req.req_pool_idx is not None
+                tail_full = self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, P:seq_len
+                ]
+                swa_out_parts.append(
+                    allocator_sw.translate_loc_from_full_to_swa(tail_full)
+                )
+
+        if not swa_out_parts:
+            return
+
+        self.swa_recompute_txns = txns
+        self.swa_out_cache_loc_override = torch.cat(swa_out_parts).to(torch.int32)
+        assert len(self.swa_out_cache_loc_override) == self.extend_num_tokens, (
+            f"{len(self.swa_out_cache_loc_override)=}, " f"{self.extend_num_tokens=}"
+        )
+
+    def commit_swa_recompute(self) -> None:
+        txns = self.swa_recompute_txns
+        if not txns:
+            return
+
+        allocator_sw = self.token_to_kv_pool_allocator
+        assert isinstance(
+            allocator_sw, SWATokenToKVPoolAllocator
+        ), "SWA-window recompute requires a SWATokenToKVPoolAllocator"
+        complete_lock = getattr(self.tree_cache, "complete_swa_recompute_lock", None)
+        assert complete_lock is not None, (
+            "SWA-window recompute requires a prefix cache with "
+            "complete_swa_recompute_lock"
+        )
+
+        for txn in txns:
+            allocator_sw.commit_fresh_swa_for_recompute_window(
+                txn.full_indices, txn.fresh_swa_indices
+            )
+
+        for txn in txns:
+            req = txn.req
+            R = txn.recompute_len
+            P = len(req.prefix_indices)
+            complete_lock(req, R)
+            req.swa_evicted_seqlen = min(req.swa_evicted_seqlen, P - R)
+            # Consumed; downstream should treat this as an ordinary hit at P.
+            req.swa_recompute_len = 0
+
+        self.swa_recompute_txns = None
+        self.swa_out_cache_loc_override = None
+
     def prepare_for_extend(self, swa_recompute_lens: Optional[List[int]] = None):
         """Build an EXTEND batch."""
         self.forward_mode = ForwardMode.EXTEND
@@ -1959,10 +2084,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         is_swa_recompute = swa_recompute_lens is not None and any(
             r > 0 for r in swa_recompute_lens
         )
+        self.swa_recompute_txns = None
+        self.swa_out_cache_loc_override = None
         if is_swa_recompute:
             assert isinstance(
                 self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
             ), "SWA-window recompute requires a SWATokenToKVPoolAllocator"
+            assert (
+                not self.model_config.is_encoder_decoder
+            ), "SWA-window recompute does not support encoder-decoder models"
             assert len(swa_recompute_lens) == len(reqs)
             recompute_lens = list(swa_recompute_lens)
             input_ids = [
@@ -2029,31 +2159,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = (
                 alloc_for_extend_swa_recompute(self, recompute_lens)
             )
-            for i, req in enumerate(reqs):
-                R = recompute_lens[i]
-                if R <= 0:
-                    continue
-                P = len(req.prefix_indices)
-                window_full = req.prefix_indices[P - R : P]
-                allocator_sw = self.token_to_kv_pool_allocator
-                swa_avail = allocator_sw.swa_attn_allocator.available_size()
-                if R > swa_avail:
-                    from sglang.srt.mem_cache.base_prefix_cache import EvictParams
-
-                    self.tree_cache.evict(
-                        EvictParams(num_tokens=0, swa_num_tokens=R - swa_avail)
-                    )
-                swa_indices = allocator_sw.alloc_swa_for_recompute_window(window_full)
-                if swa_indices is None:
-                    swa_avail_after = allocator_sw.swa_attn_allocator.available_size()
-                    raise AssertionError(
-                        "SWA-window recompute: SWA alloc failed despite "
-                        f"pre-check; R={R}, "
-                        f"swa_avail_before_evict={swa_avail}, "
-                        f"swa_avail_after_evict={swa_avail_after}, "
-                        f"swa_evictable={self.tree_cache.swa_evictable_size()}, "
-                        f"page_size={allocator_sw.page_size}, rid={req.rid}"
-                    )
+            self._alloc_swa_recompute_windows(recompute_lens)
         else:
             out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = (
                 alloc_for_extend(self)
@@ -2131,15 +2237,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     # - len(prefix_indices) = device_original + host_loaded
                     # - host_hit_length = total tokens from host cache (including storage-prefetched)
                     # - storage_hit_length = tokens loaded from storage backend (L3 hits)
-                    # - device_portion = len(prefix_indices) - host_hit_length
+                    # - device_portion = pre_len - host_hit_length
                     #
+                    # For SWA recompute, pre_len excludes the recomputed suffix;
+                    # those tokens are forwarded, not counted as cached.
                     # Storage hits are now tracked via scheduler after prefetch completes.
                     # storage_hit_length is set by scheduler.pop_prefetch_loaded_tokens()
                     host_total = req.host_hit_length
                     # Clamp storage to host_total to handle edge cases
                     storage_portion = min(host_total, req.storage_hit_length)
                     host_portion = host_total - storage_portion
-                    device_portion = max(0, len(req.prefix_indices) - host_total)
+                    device_portion = max(0, pre_len - host_total)
 
                     req.cached_tokens_device = device_portion
                     req.cached_tokens_host = host_portion
@@ -2846,10 +2954,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return ScheduleBatch(
             reqs=self.reqs[:],
             req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            tree_cache=self.tree_cache,
             req_pool_indices=self.req_pool_indices,
             model_config=self.model_config,
             forward_mode=self.forward_mode,
             out_cache_loc=self.out_cache_loc,
+            swa_out_cache_loc_override=self.swa_out_cache_loc_override,
+            swa_recompute_txns=self.swa_recompute_txns,
             return_logprob=self.return_logprob,
             decoding_reqs=self.decoding_reqs,
             spec_algorithm=self.spec_algorithm,

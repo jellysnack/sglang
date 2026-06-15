@@ -564,8 +564,9 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock),
             skip_swa=req.swa_prefix_lock_released,
         )
+        swa_recompute_len = match_result.swa_recompute_len if chunked else 0
+        result = self.inc_lock_ref(new_last_node, skip_swa=swa_recompute_len > 0)
         req.swa_prefix_lock_released = False
-        result = self.inc_lock_ref(new_last_node)
         swa_uuid_for_lock = result.swa_uuid_for_lock
 
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
@@ -577,6 +578,9 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             req.prefix_indices = new_indices
         req.last_node = new_last_node
         req.swa_uuid_for_lock = swa_uuid_for_lock
+        req.swa_prefix_lock_released = result.swa_skipped
+        if chunked:
+            req.swa_recompute_len = swa_recompute_len
 
     def revive_swa_tombstone_window(
         self, last_node: TreeNode, recompute_len: int
@@ -752,6 +756,8 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                     # 4. Iteratively delete tombstone leaves to maintain invariant that leaf nodes are not tombstone
                     self._iteratively_delete_tombstone_leaf(x)
 
+                if not self.swa_lru_list.in_list(x_next):
+                    x_next = self.swa_lru_list.get_lru_no_lock()
                 x = x_next
 
         if recompute_mode and (full_num_tokens > 0 or swa_num_tokens > 0):
@@ -767,28 +773,24 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             num_tokens_evicted=full_num_evicted, swa_num_tokens_evicted=swa_num_evicted
         )
 
-    def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
+    def inc_lock_ref(self, node: TreeNode, skip_swa: bool = False) -> IncLockRefResult:
         """
         Increment the lock reference count for the node. Returns the swa_uuid_for_lock, which needs
         to be passed to dec_lock_ref.
         It locks the full_lock_ref for nodes between the [last node, root), exclusive.
         It locks the swa_lock_ref for nodes between the [last node, swa_uuid_for_lock], inclusive.
 
-        SWA-window recompute: when ``last_node`` is a tombstone the SWA chain
-        has no slots to lock — the inc_lock_swa assert would fire immediately.
-        Skip the SWA walk and return ``swa_skipped=True``; ``dec_lock_ref``
-        mirrors via ``params.swa_skipped``. The window's SWA slots are
-        allocated later in ``prepare_for_extend`` and the tombstones flipped
-        by ``_revive_swa_recompute`` (Python-single-threaded
-        scheduler, so no race).
+        SWA-window recompute passes ``skip_swa=True`` because it will
+        recompute the whole trailing window. The SWA refs are acquired later by
+        ``complete_swa_recompute_lock`` as part of the same request lock.
         """
         if self.disable:
             return IncLockRefResult()
 
-        if node.swa_tombstone:
-            # Full-lock-only walk. Does not touch swa_lock_ref /
-            # swa_evictable_size_ / swa_protected_size_ / node.swa_uuid for
-            # ANY ancestor; dec_lock_ref must skip SWA symmetrically.
+        if skip_swa or self._has_swa_tombstone_in_window(
+            node, self.sliding_window_size
+        ):
+            # Full-lock-only walk. dec_lock_ref must skip SWA symmetrically.
             while node != self.root_node:
                 assert (
                     node.full_lock_ref >= 0
@@ -830,6 +832,68 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                     swa_uuid_for_lock = node.swa_uuid
             node = node.parent
         return IncLockRefResult(swa_uuid_for_lock=swa_uuid_for_lock)
+
+    def _has_swa_tombstone_in_window(self, node: TreeNode, window_len: int) -> bool:
+        if not envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.get():
+            return False
+
+        covered = 0
+        while node != self.root_node and covered < window_len:
+            if node.swa_tombstone:
+                return True
+            covered += len(node.value)
+            node = node.parent
+        return False
+
+    def _acquire_swa_refs_for_existing_full_lock(
+        self, node: TreeNode, lock_len: int
+    ) -> Optional[int]:
+        swa_lock_size = 0
+        swa_uuid_for_lock = None
+        while node != self.root_node and swa_lock_size < lock_len:
+            assert (
+                node.full_lock_ref > 0
+            ), f"complete_swa_recompute_lock on node without full lock, {node.id=}"
+            assert (
+                not node.swa_tombstone
+            ), f"complete_swa_recompute_lock on swa_tombstone node, {node.id=}"
+
+            if node.swa_lock_ref == 0:
+                self.swa_evictable_size_ -= len(node.value)
+                self.swa_protected_size_ += len(node.value)
+            node.swa_lock_ref += 1
+            swa_lock_size += len(node.value)
+            if swa_lock_size >= lock_len:
+                if node.swa_uuid is None:
+                    node.swa_uuid = gen_swa_uuid()
+                swa_uuid_for_lock = node.swa_uuid
+            node = node.parent
+
+        assert swa_lock_size >= lock_len, (
+            "complete_swa_recompute_lock did not cover the requested window, "
+            f"{swa_lock_size=}, {lock_len=}"
+        )
+        return swa_uuid_for_lock
+
+    def complete_swa_recompute_lock(self, req: Req, recompute_len: int) -> None:
+        """Upgrade this request lock to cover the SWA recompute window.
+
+        Admission acquired the FULL side only. After ``prepare_for_extend``
+        allocates SWA pages, this revives tombstones and acquires the SWA refs
+        for ``R`` as part of the same request lock.
+        """
+        if self.disable or recompute_len <= 0:
+            return
+
+        assert req.swa_prefix_lock_released, (
+            "complete_swa_recompute_lock expects a FULL-only request lock, "
+            f"rid={req.rid}"
+        )
+        self.revive_swa_tombstone_window(req.last_node, recompute_len)
+        req.swa_uuid_for_lock = self._acquire_swa_refs_for_existing_full_lock(
+            req.last_node, recompute_len
+        )
+        req.swa_prefix_lock_released = False
 
     def dec_lock_ref(
         self,
@@ -1030,6 +1094,8 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 match_len_since_tombstone = 0
 
             prefix_len = child.key.match(key, page_size=self.page_size)
+            if prefix_len == 0:
+                break
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
                 value.append(new_node.value)
@@ -1094,6 +1160,8 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 self._compact_single_child_chain(child)
 
             prefix_len = child.key.match(key, page_size=self.page_size)
+            if prefix_len == 0:
+                break
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
                 value.append(new_node.value)

@@ -110,10 +110,10 @@ class IncLockRefResult:
     skip_lock_node_ids: dict[ComponentType, set[int]] = dataclasses.field(
         default_factory=dict
     )
-    # SWA-window recompute: True iff inc_lock_ref skipped the SWA walk because
-    # last_node was a recompute tombstone. The matching dec_lock_ref must skip
-    # SWA symmetrically. Propagated through to_dec_params; long-lived per-req
-    # locks mirror it onto req.swa_prefix_lock_released.
+    # SWA-window recompute: True iff inc_lock_ref skipped the SWA walk. The
+    # matching dec_lock_ref must skip SWA symmetrically. Propagated through
+    # to_dec_params; long-lived per-req locks mirror it onto
+    # req.swa_prefix_lock_released.
     swa_skipped: bool = False
 
     def to_dec_params(self) -> DecLockRefParams:

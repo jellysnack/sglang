@@ -297,6 +297,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     out_cache_loc: torch.Tensor
     # The sum of all sequence lengths
     seq_lens_sum: int
+    # Optional SWA write-target override for SWA-window recompute COW pages.
+    swa_out_cache_loc_override: Optional[torch.Tensor] = None
 
     # === Borrowed from ScheduleBatch: GPU tensors (cross-stream; clone targets for stream isolation) ===
     # FIXME(lsyin): these are currently aliased by reference from ScheduleBatch. Once
@@ -631,6 +633,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             seq_lens=batch.seq_lens,
             out_cache_loc=batch.out_cache_loc,
             seq_lens_sum=batch.seq_lens_sum,
+            swa_out_cache_loc_override=batch.swa_out_cache_loc_override,
             # Inputs aliased by reference from ScheduleBatch
             seq_lens_cpu=seq_lens_cpu,
             orig_seq_lens=batch.orig_seq_lens,
@@ -1203,6 +1206,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
 
         self.out_cache_loc = self._pad_tensor_to_size(self.out_cache_loc, num_tokens)
+        if self.swa_out_cache_loc_override is not None:
+            self.swa_out_cache_loc_override = self._pad_tensor_to_size(
+                self.swa_out_cache_loc_override, num_tokens
+            )
         if self.encoder_lens is not None:
             self.encoder_lens = self._pad_tensor_to_size(self.encoder_lens, bs)
         self.positions = self._pad_tensor_to_size(self.positions, num_tokens)

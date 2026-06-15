@@ -199,6 +199,8 @@ class CompressorPrefillPlan(NamedTuple):
         num_q_tokens: int,
         use_cuda_graph: bool = False,
         recompute_boundary: Optional[torch.Tensor] = None,
+        swa_out_cache_loc_override: Optional[torch.Tensor] = None,
+        extend_start_loc: Optional[torch.Tensor] = None,
     ) -> CompressorPrefillPlan:
         is_gpu_input = seq_lens.device.type == "cuda"
         pin_buffer = torch.empty(
@@ -211,6 +213,22 @@ class CompressorPrefillPlan(NamedTuple):
             recompute_boundary = torch.empty(
                 0, dtype=torch.int64, device=seq_lens.device
             )
+        if swa_out_cache_loc_override is None:
+            swa_out_cache_loc_override = torch.empty(
+                0, dtype=torch.int32, device=req_pool_indices.device
+            )
+            extend_start_loc = torch.empty(
+                0, dtype=torch.int32, device=req_pool_indices.device
+            )
+        else:
+            assert (
+                extend_start_loc is not None
+            ), "swa_out_cache_loc_override requires extend_start_loc"
+            swa_out_cache_loc_override = swa_out_cache_loc_override.to(torch.int32)
+            extend_start_loc = extend_start_loc.to(torch.int32)
+            assert (
+                swa_out_cache_loc_override.numel() >= num_q_tokens
+            ), f"{swa_out_cache_loc_override.numel()=} < {num_q_tokens=}"
         module = _jit_compress_plan_module()
         plan_c, plan_w = module.plan_prefill(
             req_pool_indices,
@@ -219,6 +237,8 @@ class CompressorPrefillPlan(NamedTuple):
             seq_lens,
             extend_lens,
             recompute_boundary,
+            swa_out_cache_loc_override,
+            extend_start_loc,
             pin_buffer,
             int(num_q_tokens),
             int(compress_ratio),

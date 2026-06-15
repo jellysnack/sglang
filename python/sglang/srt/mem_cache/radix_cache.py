@@ -137,10 +137,17 @@ class RadixKey:
 
     def match(self, other: RadixKey, page_size: int = 1) -> int:
         """Logical-unit prefix length shared with ``other``. Result is rounded down to ``page_size``."""
+        return self.match_from(other, 0, page_size)
+
+    def match_from(self, other: RadixKey, other_start: int, page_size: int = 1) -> int:
+        """Prefix match against ``other[other_start:]`` without materializing it."""
         self._check_compatible(other)
         t0, t1 = self.token_ids, other.token_ids
         assert type(t0) is type(t1), (type(t0), type(t1))
-        n = min(len(t0), len(t1))
+        if other_start < 0 or other_start > len(other):
+            raise IndexError(f"RadixKey offset out of range: {other_start}")
+        other_raw_start = other_start
+        n = min(len(t0), len(t1) - other_raw_start)
 
         # Exponential search for the first diverging token: gallop in doubling
         # windows (one C-level slice compare each), then binary-search the window
@@ -150,10 +157,10 @@ class RadixKey:
         step = 1
         while lo < n:
             hi = lo + step if lo + step < n else n
-            if t0[lo:hi] != t1[lo:hi]:
+            if t0[lo:hi] != t1[other_raw_start + lo : other_raw_start + hi]:
                 while hi - lo > 1:
                     mid = (lo + hi) // 2
-                    if t0[lo:mid] == t1[lo:mid]:
+                    if t0[lo:mid] == t1[other_raw_start + lo : other_raw_start + mid]:
                         lo = mid
                     else:
                         hi = mid
@@ -163,7 +170,10 @@ class RadixKey:
             step *= 2
 
         if self.is_bigram:
-            matched = max(0, min(matched_tokens - 1, len(self), len(other)))
+            matched = max(
+                0,
+                min(matched_tokens - 1, len(self), len(other) - other_start),
+            )
             return (matched // page_size) * page_size if page_size > 1 else matched
 
         if page_size == 1:
@@ -172,14 +182,22 @@ class RadixKey:
 
     def child_key(self, page_size: int = 1):
         """Hashable dict-key for the first ``page_size`` logical units, namespaced by ``extra_key``."""
+        return self.child_key_from(0, page_size)
+
+    def child_key_from(self, start: int, page_size: int = 1):
+        """Hashable dict-key for ``self[start:start + page_size]``."""
         t = self.token_ids
+        if start < 0 or start >= len(self):
+            raise IndexError(f"RadixKey child-key offset out of range: {start}")
         if self.is_bigram:
             if page_size == 1:
-                plain = (t[0], t[1])
+                plain = (t[start], t[start + 1])
             else:
-                plain = tuple((t[j], t[j + 1]) for j in range(page_size))
+                plain = tuple(
+                    (t[start + j], t[start + j + 1]) for j in range(page_size)
+                )
         else:
-            plain = t[0] if page_size == 1 else tuple(t[:page_size])
+            plain = t[start] if page_size == 1 else tuple(t[start : start + page_size])
         return plain if self.extra_key is None else (self.extra_key, plain)
 
     def hash_page(self, start: int, end: int, prior_hash: Optional[str] = None) -> str:

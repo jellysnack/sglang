@@ -671,6 +671,8 @@ def create_paged_compressor_data(
     use_prefill_cuda_graph: bool = False,
     num_q_tokens: Optional[int] = None,
     recompute_boundaries: Optional[List[int]] = None,
+    swa_out_cache_loc_override: Optional[torch.Tensor] = None,
+    extend_start_loc: Optional[torch.Tensor] = None,
 ) -> CompressMetadata:
     """Build the paged compress metadata (= the plan).
 
@@ -681,6 +683,9 @@ def create_paged_compressor_data(
     below which the compressed-pool / indexer WRITE is suppressed (the
     compressed pools are reused for the recompute window). ``None`` or an
     all-prefix_len list means no suppression.
+
+    ``swa_out_cache_loc_override`` is a COW SWA target for current extend
+    tokens; prefix positions still translate through ``full_to_swa``.
     """
     if _use_online_compress(compress_ratio):
         # Online c128 compressor: per-position WRITE suppression is not wired
@@ -740,6 +745,8 @@ def create_paged_compressor_data(
             num_q_tokens=num_q_tokens,
             use_cuda_graph=use_prefill_cuda_graph,
             recompute_boundary=recompute_boundary_planner,
+            swa_out_cache_loc_override=swa_out_cache_loc_override,
+            extend_start_loc=extend_start_loc,
         )
     else:
         return CompressorDecodePlan.generate(
