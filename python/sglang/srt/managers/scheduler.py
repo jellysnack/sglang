@@ -224,6 +224,7 @@ from sglang.srt.managers.utils import (
 )
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -497,6 +498,10 @@ class Scheduler(
 
         # Init chunked prefill
         self.init_chunked_prefill()
+
+        # Fail fast at startup if --chunked-prefill-size cannot fit the SWA
+        # recompute window + at least one page of tail.
+        self._assert_swa_recompute_chunk_size_compatible()
 
         # Init diffusion LLM
         self.init_diffusion_llm()
@@ -1024,6 +1029,157 @@ class Scheduler(
             metrics_collector=self.metrics_collector,
         )
 
+    def _assert_swa_recompute_chunk_size_compatible(self):
+        """Ensure chunked prefill can fit one recompute window plus tail page."""
+        if not envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.get():
+            return
+        if is_hip():
+            raise ValueError(
+                "SGLANG_OPT_SWA_RECOMPUTE_WINDOW=1 is not supported on the "
+                "DeepSeek V4 HIP radix attention backend yet."
+            )
+        if not isinstance(self.tree_cache, UnifiedRadixCache):
+            raise ValueError(
+                "SGLANG_OPT_SWA_RECOMPUTE_WINDOW=1 currently requires "
+                f"UnifiedRadixCache. Got {type(self.tree_cache).__name__}."
+            )
+        if self.chunked_prefill_size is None:
+            return
+        w_r = self.tree_cache._swa_recompute_window_size()
+        required = w_r + self.page_size
+        if self.chunked_prefill_size < required:
+            raise ValueError(
+                "SGLANG_OPT_SWA_RECOMPUTE_WINDOW=1 requires "
+                f"--chunked-prefill-size >= W_r + page_size = {required} "
+                f"for this model (W_r = page-aligned recompute window = {w_r}, "
+                f"page_size = {self.page_size}). Got "
+                f"--chunked-prefill-size={self.chunked_prefill_size}. "
+                "Either raise the chunked prefill size or disable the "
+                "SWA-window recompute feature."
+            )
+
+    def _prepare_swa_recompute_waiting_queue_across_cp(self) -> Optional[int]:
+        """Make SWA-recompute admission deterministic across CP ranks.
+
+        SWA cache state is local to each CP rank, so one rank can see a normal
+        SWA hit while another must recompute the same prefix tail. CP forward
+        needs the same request order and the same recompute window on every
+        rank, so synchronize the queue before admission starts.
+        """
+        if (
+            not envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.get()
+            or self.ps.attn_cp_size <= 1
+            or not isinstance(self.tree_cache, UnifiedRadixCache)
+        ):
+            return None
+        if not self.waiting_queue:
+            return None
+
+        # Phase 1: collect each rank's queue with per-request prefetch
+        # readiness. The rid set must match on every rank; the order may differ
+        # because cache-aware priority can observe rank-local SWA state.
+        if self.enable_hicache_storage:
+            # Complete ready L3 prefetches before prefix matching. Requests
+            # whose prefetch is still pending on some rank are left for the
+            # next scheduler round, so admission never consumes a newly
+            # completed prefetch with a stale recompute decision.
+            local_ready = [
+                (req.rid, bool(self.tree_cache.check_prefetch_progress(req.rid)))
+                for req in self.waiting_queue
+            ]
+        else:
+            local_ready = [(req.rid, True) for req in self.waiting_queue]
+        gathered_ready: List[List[Tuple[str, bool]]] = [
+            [] for _ in range(self.ps.attn_cp_size)
+        ]
+        torch.distributed.all_gather_object(
+            gathered_ready, local_ready, group=self.attn_cp_cpu_group
+        )
+
+        canonical_rids = [rid for rid, _ in gathered_ready[0]]
+        ready_by_rank = [dict(rank_items) for rank_items in gathered_ready]
+        for rank_ready in ready_by_rank:
+            if rank_ready.keys() != set(canonical_rids):
+                raise AssertionError(
+                    "SWA-window recompute CP sync found different waiting "
+                    f"queues: rank_rids={sorted(rank_ready)}, "
+                    f"canonical_rids={canonical_rids}"
+                )
+
+        # Rank 0's order becomes the canonical order for this scheduler round.
+        local_by_rid = {req.rid: req for req in self.waiting_queue}
+        self.waiting_queue = [local_by_rid[rid] for rid in canonical_rids]
+
+        ready_count = 0
+        for rid in canonical_rids:
+            if not all(rank_ready[rid] for rank_ready in ready_by_rank):
+                break
+            ready_count += 1
+
+        # Phase 2: run local prefix matching in the canonical order. This fills
+        # req.swa_recompute_len from the local SWA cache state.
+        candidate_reqs = self.waiting_queue[:ready_count]
+        for req in candidate_reqs:
+            req.init_next_round_input(self.tree_cache)
+
+        # Phase 3: synchronize the recompute decision. If any rank needs to
+        # rebuild a request's SWA tail, all ranks use that same window.
+        local_windows = [
+            (max(0, int(req.swa_recompute_len)), max(0, int(req.host_hit_length)))
+            for req in candidate_reqs
+        ]
+        gathered_windows: List[List[Tuple[int, int]]] = [
+            [] for _ in range(self.ps.attn_cp_size)
+        ]
+        torch.distributed.all_gather_object(
+            gathered_windows, local_windows, group=self.attn_cp_cpu_group
+        )
+
+        synced_recompute_lens = [0] * ready_count
+        any_host_hit = [False] * ready_count
+        for rank_windows in gathered_windows:
+            assert len(rank_windows) == ready_count, (
+                "SWA-window recompute CP sync found different candidate "
+                f"counts: {len(rank_windows)=}, {ready_count=}"
+            )
+            for i, (recompute_len, host_hit_length) in enumerate(rank_windows):
+                synced_recompute_lens[i] = max(synced_recompute_lens[i], recompute_len)
+                any_host_hit[i] = any_host_hit[i] or host_hit_length > 0
+
+        # Phase 4: apply the synchronized window before PrefillAdder admission.
+        for i, req in enumerate(candidate_reqs):
+            synced_recompute_len = synced_recompute_lens[i]
+            if synced_recompute_len == 0:
+                continue
+
+            # If the synchronized recompute window would depend on HiCache FULL
+            # load-back on any rank, fall back to cold prefill on all CP ranks.
+            # This keeps prefix lengths and input tensors identical even if a
+            # later host/storage load-back would complete differently per rank.
+            if any_host_hit[i]:
+                req.reset_swa_recompute_to_cold_prefill(self.tree_cache.root_node)
+                continue
+
+            local_recompute_len = max(0, int(req.swa_recompute_len))
+            if synced_recompute_len == local_recompute_len:
+                continue
+
+            matched_prefix_len = len(req.prefix_indices) + req.host_hit_length
+            assert synced_recompute_len <= matched_prefix_len, (
+                "SWA-window recompute CP sync produced a recompute window larger "
+                f"than the local prefix: rid={req.rid}, "
+                f"local_recompute_len={local_recompute_len}, "
+                f"synced_recompute_len={synced_recompute_len}, "
+                f"device_prefix_len={len(req.prefix_indices)}, "
+                f"host_hit_length={req.host_hit_length}"
+            )
+            # If any rank lost the SWA tail, every rank recomputes the same tail
+            # into private SWA pages.
+            req.swa_recompute_len = synced_recompute_len
+            req.swa_host_hit_length = 0
+
+        return len(candidate_reqs)
+
     def init_schedule_policy(self):
         # Init schedule policy and new token estimation
         self.policy = SchedulePolicy(
@@ -1487,6 +1643,7 @@ class Scheduler(
             runner.war_fastpath_read_done_event = None
         else:
             self.schedule_stream.wait_stream(self.forward_stream)
+        self._commit_swa_recompute_for_queued_batch()
 
     @DynamicGradMode()
     def event_loop_normal(self):
@@ -1511,7 +1668,7 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
-                result = self.run_batch(batch)
+                result = self.run_batch_with_swa_recompute_cleanup(batch)
                 self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states.
@@ -1572,7 +1729,7 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
-                batch_result = self.run_batch(batch)
+                batch_result = self.run_batch_with_swa_recompute_cleanup(batch)
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
@@ -1630,6 +1787,20 @@ class Scheduler(
         )
 
         return disable_overlap_for_batch or need_grammar_sync
+
+    def _commit_swa_recompute_for_queued_batch(self) -> None:
+        """Commit SWA recompute metadata before scheduling the next batch.
+
+        Overlap mode delays full result processing by one iteration, but the
+        next scheduling pass may stash the previous chunk and re-match against
+        the prefix cache. Once the WAR barrier has confirmed the forward writes
+        are done, the SWA full->SWA mapping must be visible before that re-match.
+        """
+        result_queue = getattr(self, "result_queue", None)
+        if not result_queue:
+            return
+        batch, _ = result_queue[0]
+        batch.commit_swa_recompute()
 
     @scheduler_nvtx_method("scheduler.process_input_requests")
     def process_input_requests(self, recv_reqs: List):
@@ -2867,6 +3038,10 @@ class Scheduler(
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
+        prepared_waiting_queue_count = (
+            self._prepare_swa_recompute_waiting_queue_across_cp()
+        )
+
         if self.enable_lora:
             running_loras = {
                 req.lora_id for req in running_batch.reqs if not req.finished()
@@ -2884,7 +3059,12 @@ class Scheduler(
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         # Get requests from the waiting queue to a new prefill batch
-        for req in self.waiting_queue:
+        waiting_queue_candidates = (
+            self.waiting_queue
+            if prepared_waiting_queue_count is None
+            else self.waiting_queue[:prepared_waiting_queue_count]
+        )
+        for req in waiting_queue_candidates:
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
 
@@ -2914,7 +3094,8 @@ class Scheduler(
                 if loaded_tokens > 0:
                     req.storage_hit_length = loaded_tokens
 
-            req.init_next_round_input(self.tree_cache)
+            if prepared_waiting_queue_count is None:
+                req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
@@ -2976,6 +3157,14 @@ class Scheduler(
 
         set_time_batch(can_run_list, "set_forward_entry_time")
 
+        swa_recompute_lens: Optional[List[int]] = None
+        if (
+            envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.get()
+            and isinstance(self.tree_cache, UnifiedRadixCache)
+            and any(req.swa_recompute_len > 0 for req in can_run_list)
+        ):
+            swa_recompute_lens = [max(0, req.swa_recompute_len) for req in can_run_list]
+
         # Create a new batch
         new_batch = ScheduleBatch.init_new(
             can_run_list,
@@ -2999,7 +3188,7 @@ class Scheduler(
                 self.tree_cache.ready_to_load_host_cache()
             )
 
-        new_batch.prepare_for_extend()
+        new_batch.prepare_for_extend(swa_recompute_lens=swa_recompute_lens)
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:
@@ -3026,6 +3215,10 @@ class Scheduler(
             and not (new_batch.return_logprob or running_batch.return_logprob)
             # mix_with_running cats input_ids but not input_embeds — shapes would mismatch
             and new_batch.input_embeds is None
+            # SWA recompute rewrites matched-prefix KV slots. Keep it out of a
+            # mixed prefill+decode batch so decode cannot read those slots while
+            # prefill is refreshing them.
+            and swa_recompute_lens is None
         ):
             # TODO (lianmin): support return_logprob + mixed chunked prefill
             running_batch.filter_batch()
@@ -3422,6 +3615,17 @@ class Scheduler(
 
         return ret
 
+    def run_batch_with_swa_recompute_cleanup(
+        self,
+        batch: ScheduleBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
+        try:
+            return self.run_batch(batch, pp_proxy_tensors=pp_proxy_tensors)
+        except BaseException:
+            batch.abort_swa_recompute()
+            raise
+
     def _maybe_report_active_ranks(self) -> None:
         if not (
             self.enable_dp_attention and self.server_args.elastic_ep_backend is not None
@@ -3491,6 +3695,7 @@ class Scheduler(
         if batch.forward_mode.is_decode():
             self.batch_result_processor.process_batch_result_decode(batch, result)
         elif batch.forward_mode.is_extend():
+            batch.commit_swa_recompute()
             if batch.is_dllm():
                 self.process_batch_result_dllm(batch, result)
             elif self.disaggregation_mode == DisaggregationMode.PREFILL:

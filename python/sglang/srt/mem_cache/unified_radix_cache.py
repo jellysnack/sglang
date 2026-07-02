@@ -51,6 +51,7 @@ from sglang.srt.mem_cache.unified_cache_components import (
     SWAComponent,
     TreeComponent,
     get_and_increase_time_counter,
+    next_component_uuid,
 )
 from sglang.srt.mem_cache.utils import (
     compute_node_hash_values,
@@ -582,6 +583,28 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if len(key) == 0:
             return self._empty_match_result
 
+        # Recompute path returns -1 when the length gate wants legacy matching.
+        if (
+            envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.get()
+            and ComponentType.SWA in self.components
+        ):
+            (
+                value,
+                best_match_node,
+                best_match_device_node,
+                best_match_device_value_len,
+                swa_recompute_len,
+            ) = self._match_prefix_helper_recompute(key)
+            if swa_recompute_len >= 0:
+                return self._match_post_processor(
+                    params,
+                    value,
+                    best_match_node,
+                    best_match_device_node,
+                    best_match_device_value_len,
+                    swa_recompute_len=swa_recompute_len,
+                )
+
         (
             value,
             best_match_node,
@@ -634,18 +657,137 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             mamba_num_evicted=tracker.get(ComponentType.MAMBA, 0),
         )
 
+    def revive_swa_tombstone_window(
+        self, last_node: UnifiedTreeNode, recompute_len: int
+    ) -> int:
+        """Materialize live device SWA for the valid recomputed tail."""
+        assert (
+            recompute_len % self.page_size == 0
+        ), f"recompute_len must be page aligned, {recompute_len=}, {self.page_size=}"
+        if recompute_len <= 0 or last_node is self.root_node:
+            return 0
+        swa_comp = self.components.get(ComponentType.SWA)
+        assert (
+            swa_comp is not None
+        ), "revive_swa_tombstone_window requires an SWA component"
+
+        revived = 0
+        covered = 0
+        node = last_node
+        while node is not self.root_node and covered < recompute_len:
+            remaining = recompute_len - covered
+            node_len = len(node.key)
+            if node_len > remaining:
+                # Boundary inside this node: split so the trailing `remaining`
+                # tokens become their own child; revive only that tail.
+                self._split_node(node.key, node, node_len - remaining)
+                node_len = len(node.key)
+
+            if node.component_data[ComponentType.SWA].value is None:
+                # Fresh recompute pages may replace either a true tombstone or a
+                # host-only SWA sidecar. After commit, the request lock needs a
+                # device value in both cases.
+                if swa_comp.materialize_recompute_device_value(node):
+                    revived += node_len
+
+            covered += node_len
+            node = node.parent
+
+        return revived
+
+    def _should_skip_swa_for_recompute(self, node: Any) -> bool:
+        """Skip SWA locking when the regular SWA window has a tombstone."""
+        swa = self.components.get(ComponentType.SWA)
+        if swa is None or not envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.get():
+            return False
+
+        covered = 0
+        cur = node
+        while cur != self.root_node and covered < swa.sliding_window_size:
+            if swa.is_swa_recompute_tombstone(cur):
+                return True
+            comp = cur.component_data[ComponentType.SWA]
+            covered += len(comp.value) if comp.value is not None else len(cur.key)
+            cur = cur.parent
+        return False
+
     def inc_lock_ref(self, node: Any) -> IncLockRefResult:
-        result = self.session.try_inc_lock_ref(node)
+        return self._inc_lock_ref_impl(
+            node, skip_swa=self._should_skip_swa_for_recompute(node)
+        )
+
+    def inc_lock_ref_for_swa_recompute(self, node: Any) -> IncLockRefResult:
+        """Acquire the FULL part of a recompute prefix lock.
+
+        The SWA part is acquired after the recompute forward commits fresh SWA
+        pages into the radix tree.
+        """
+        return self._inc_lock_ref_impl(node, skip_swa=True)
+
+    def _inc_lock_ref_impl(self, node: Any, skip_swa: bool = False) -> IncLockRefResult:
+        result = None if skip_swa else self.session.try_inc_lock_ref(node)
         if result is not None:
             return result
         if self.disable:
             return IncLockRefResult()
-        result = IncLockRefResult()
+        result = IncLockRefResult(swa_skipped=skip_swa)
         for component in self._components_tuple:
+            if skip_swa and component.component_type == ComponentType.SWA:
+                continue
             result = component.acquire_component_lock(node=node, result=result)
 
         self._update_evictable_leaf_sets(node)
         return result
+
+    def _acquire_swa_refs_for_existing_full_lock(
+        self, node: Any, lock_len: int
+    ) -> Optional[int]:
+        ct = ComponentType.SWA
+        swa_lock_size = 0
+        swa_uuid_for_lock = None
+        cur = node
+        while cur != self.root_node and swa_lock_size < lock_len:
+            comp = cur.component_data[ct]
+            assert (
+                cur.component_data[BASE_COMPONENT_TYPE].lock_ref > 0
+            ), f"complete_swa_recompute_lock on node without full lock, {cur.id=}"
+            assert (
+                comp.value is not None
+            ), f"complete_swa_recompute_lock on missing SWA value, {cur.id=}"
+            if comp.lock_ref == 0:
+                key_len = len(comp.value)
+                self.component_evictable_size_[ct] -= key_len
+                self.component_protected_size_[ct] += key_len
+            comp.lock_ref += 1
+            swa_lock_size += len(comp.value)
+            if swa_lock_size >= lock_len:
+                if comp.metadata.get("uuid") is None:
+                    comp.metadata["uuid"] = next_component_uuid()
+                swa_uuid_for_lock = comp.metadata["uuid"]
+            cur = cur.parent
+
+        assert swa_lock_size >= lock_len, (
+            "complete_swa_recompute_lock did not cover the requested SWA tail, "
+            f"{swa_lock_size=}, {lock_len=}"
+        )
+        self._update_evictable_leaf_sets(node)
+        return swa_uuid_for_lock
+
+    def complete_swa_recompute_lock(self, req: Req, recompute_len: int) -> None:
+        """Upgrade this request lock to cover the valid recomputed SWA tail."""
+        if self.disable or recompute_len <= 0:
+            return
+        swa = self.components.get(ComponentType.SWA)
+        assert swa is not None, "complete_swa_recompute_lock requires SWA"
+        assert req.swa_prefix_lock_released, (
+            "complete_swa_recompute_lock expects a FULL-only request lock, "
+            f"rid={req.rid}"
+        )
+        self.revive_swa_tombstone_window(req.last_node, recompute_len)
+        req.swa_uuid_for_lock = self._acquire_swa_refs_for_existing_full_lock(
+            req.last_node, recompute_len
+        )
+        req.swa_prefix_lock_released = False
 
     def dec_lock_ref(
         self,
@@ -658,6 +800,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return result
         if self.disable:
             return DecLockRefResult()
+        skip_swa = params is not None and params.swa_skipped
         for component in self._components_tuple:
             if skip_swa and component.component_type == ComponentType.SWA:
                 continue
@@ -692,8 +835,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def inc_host_lock_ref(self, node: Any) -> IncLockRefResult:
         if self.disable:
             return IncLockRefResult()
-        result = IncLockRefResult()
+        skip_swa = self._should_skip_swa_for_recompute(node)
+        result = IncLockRefResult(swa_skipped=skip_swa)
         for component in self._components_tuple:
+            if skip_swa and component.component_type == ComponentType.SWA:
+                continue
             result = component.acquire_component_lock(
                 node=node, result=result, lock_host=True
             )
@@ -706,7 +852,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     ) -> DecLockRefResult:
         if self.disable:
             return DecLockRefResult()
+        skip_swa = params is not None and params.swa_skipped
         for component in self._components_tuple:
+            if skip_swa and component.component_type == ComponentType.SWA:
+                continue
             component.release_component_lock(node=node, params=params, lock_host=True)
 
         self._update_evictable_leaf_sets(node)
@@ -777,9 +926,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         self.dec_lock_ref(
             req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
-            skip_swa=getattr(req, "swa_prefix_lock_released", False),
+            DecLockRefParams(
+                swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None),
+                swa_skipped=getattr(req, "swa_prefix_lock_released", False),
+            ),
         )
+        req.swa_prefix_lock_released = False
 
         # cleanup
         for comp in self._components_tuple:
@@ -867,8 +1019,20 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         self.dec_lock_ref(
             req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
+            DecLockRefParams(
+                swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None),
+                swa_skipped=getattr(req, "swa_prefix_lock_released", False),
+            ),
         )
+        if chunked and self._should_skip_swa_for_recompute(new_last_node):
+            raise AssertionError(
+                "cache_unfinished_req(chunked=True) found a missing SWA page "
+                "inside the current sliding window after stashing a chunk. "
+                "The previous chunk's SWA tail must stay protected while the "
+                f"request continues chunked prefill, rid={req.rid}, "
+                f"matched_prefix_len={len(new_indices)}, "
+                f"match_swa_recompute_len={match_result.swa_recompute_len}"
+            )
         lock_result = self.inc_lock_ref(new_last_node)
 
         # Update req fields
@@ -881,6 +1045,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         req.cache_protected_len = len(new_indices)
         req.last_node = new_last_node
         req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
+        req.swa_prefix_lock_released = lock_result.swa_skipped
+        req.swa_recompute_len = 0
 
         # cleanup
         for comp in self._components_tuple:
@@ -970,6 +1136,85 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             best_match_device_value_len,
         )
 
+    def _match_prefix_helper_recompute(
+        self, key: RadixKey
+    ) -> tuple[list[torch.Tensor], UnifiedTreeNode, UnifiedTreeNode, int, int]:
+        """Match through SWA tombstones and compute trailing recompute length."""
+        swa_comp = self.components[ComponentType.SWA]
+        node = self.root_node
+        child_key = key.child_key(self.page_size)
+        value: list[torch.Tensor] = []
+        last_device_node = self.root_node
+        last_device_value_len = 0
+        # (token-length, is_recompute_tombstone) per matched segment.
+        segments: list[tuple[int, bool]] = []
+
+        while len(key) > 0 and child_key in node.children:
+            child = node.children[child_key]
+            # FULL gone on both device and host → stop the walk.
+            if child.evicted and not child.backuped:
+                break
+
+            prefix_len = child.key.match(key, page_size=self.page_size)
+            if prefix_len < len(child.key):
+                node = self._split_node(child.key, child, prefix_len)
+                if not node.evicted:
+                    value.append(node.component_data[BASE_COMPONENT_TYPE].value)
+                    last_device_node = node
+                    last_device_value_len = len(value)
+                segments.append((prefix_len, swa_comp.is_swa_recompute_tombstone(node)))
+                break
+
+            if not child.evicted:
+                value.append(child.component_data[BASE_COMPONENT_TYPE].value)
+                last_device_node = child
+                last_device_value_len = len(value)
+            node = child
+            segments.append((len(child.key), swa_comp.is_swa_recompute_tombstone(node)))
+            key = key[prefix_len:]
+            if len(key):
+                child_key = key.child_key(self.page_size)
+
+        total_len = sum(seg_len for seg_len, _ in segments)
+        # A cache hit is valid as long as the current SWA tail is live. If the
+        # tail is tombstoned, recompute the larger dependency window.
+        w_r = swa_comp.swa_recompute_window_size()
+        swa_tail_len = swa_comp.sliding_window_size
+        force_recompute = envs.SGLANG_DEBUG_FORCE_SWA_RECOMPUTE.get()
+
+        dist_from_end = 0
+        has_tombstone_in_swa_tail = False
+        for seg_len, is_tombstone in reversed(segments):
+            if is_tombstone and dist_from_end < swa_tail_len:
+                has_tombstone_in_swa_tail = True
+                break
+            dist_from_end += seg_len
+            if dist_from_end >= swa_tail_len:
+                break
+
+        if force_recompute and total_len > 0:
+            swa_recompute_len = min(w_r, total_len) // self.page_size * self.page_size
+        elif has_tombstone_in_swa_tail:
+            swa_recompute_len = min(w_r, total_len) // self.page_size * self.page_size
+        else:
+            swa_recompute_len = 0
+
+        gated = (
+            not force_recompute
+            and swa_recompute_len > 0
+            and total_len < swa_comp.swa_recompute_gate_threshold()
+        )
+
+        if gated:
+            return value, node, last_device_node, last_device_value_len, -1
+        return (
+            value,
+            node,
+            last_device_node,
+            last_device_value_len,
+            swa_recompute_len,
+        )
+
     def _match_post_processor(
         self,
         params: MatchPrefixParams,
@@ -977,6 +1222,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         best_match_node: UnifiedTreeNode,
         best_match_device_node: UnifiedTreeNode,
         best_match_device_value_len: int,
+        swa_recompute_len: int = 0,
     ) -> MatchResult:
         node_update = best_match_node
         for comp in self._components_tuple:
@@ -1010,9 +1256,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             last_host_node=last_host_node,
             best_match_node=best_match_node,
             host_hit_length=0,
+            swa_recompute_len=swa_recompute_len,
         )
 
         for component in self._components_tuple:
+            # Recompute rewrites the trailing SWA window; skip SWA load-back
+            # bookkeeping for this match.
+            if swa_recompute_len > 0 and component.component_type == ComponentType.SWA:
+                continue
             result = component.finalize_match_result(
                 result=result,
                 params=params,
@@ -1024,6 +1275,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def _split_node(
         self, key: RadixKey, child: UnifiedTreeNode, split_len: int
     ) -> UnifiedTreeNode:
+        child_len = len(child.key)
+        assert 0 < split_len < child_len, (
+            "UnifiedRadixCache._split_node requires a non-empty proper split: "
+            f"child={child.id}, split_len={split_len}, child_len={child_len}, "
+            f"page_size={self.page_size}"
+        )
+        if self.page_size > 1:
+            assert (
+                split_len % self.page_size == 0 and child_len % self.page_size == 0
+            ), (
+                "UnifiedRadixCache._split_node requires page-aligned splits: "
+                f"child={child.id}, split_len={split_len}, child_len={child_len}, "
+                f"page_size={self.page_size}"
+            )
+
         new_node = UnifiedTreeNode(self.tree_components, priority=child.priority)
         new_node.children = {key[split_len:].child_key(self.page_size): child}
         new_node.parent = child.parent
@@ -2502,6 +2768,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         (what plain radix reuse does via its SWA match gate). 0 for every other
         layout.
         """
+        if envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.get():
+            return 0
         swa = self.components.get(ComponentType.SWA)
         unified_compress_only_hicache = (
             self.cache_controller is not None
@@ -2509,6 +2777,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             and swa._swa_kv_pool_host is None
         )
         return swa.sliding_window_size if unified_compress_only_hicache else 0
+
+    def _swa_recompute_window_size(self) -> int:
+        """Proxy to ``SWAComponent.swa_recompute_window_size`` for the
+        scheduler's startup chunk-size compatibility check."""
+        swa = self.components.get(ComponentType.SWA)
+        assert (
+            swa is not None
+        ), "_swa_recompute_window_size called without an SWA component"
+        return swa.swa_recompute_window_size()
 
     def supports_swa(self) -> bool:
         return ComponentType.SWA in self.components
@@ -2690,12 +2967,28 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             E("[Root] root has a parent pointer")
         # Parent ↔ child bidirectional consistency
         for node in all_nodes:
-            for child in node.children.values():
+            for edge_key, child in node.children.items():
                 if child.parent is not node:
                     pid = child.parent.id if child.parent else None
                     E(f"[Tree] child {child.id} parent={pid}, expected {node.id}")
                 if child.key is None:
                     E(f"[Tree] node {child.id} has no key")
+                    continue
+                key_len = len(child.key)
+                if key_len <= 0:
+                    E(f"[Tree] node {child.id} has empty key")
+                    continue
+                if self.page_size > 1 and key_len % self.page_size != 0:
+                    E(
+                        f"[Tree] node {child.id} key_len={key_len} is not "
+                        f"page-aligned (page_size={self.page_size})"
+                    )
+                expected_edge_key = child.key.child_key(self.page_size)
+                if edge_key != expected_edge_key:
+                    E(
+                        f"[Tree] child {child.id} stored under wrong edge key: "
+                        f"{edge_key=} expected={expected_edge_key}"
+                    )
 
         # ── PART 2: Per-node state machine and leaf qualification ──
         expected_dev_leaves: set[UnifiedTreeNode] = set()
@@ -2707,6 +3000,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             nid = node.id
             full_dev = node.component_data[FCT].value is not None
             full_hst = node.component_data[FCT].host_value is not None
+
+            for ct in (FCT, ComponentType.SWA):
+                if ct not in self.tree_components:
+                    continue
+                cd = node.component_data[ct]
+                if cd.value is not None and len(cd.value) != len(node.key):
+                    E(
+                        f"node {nid} {ct} device value len={len(cd.value)} "
+                        f"!= key_len={len(node.key)}"
+                    )
+                if cd.host_value is not None and len(cd.host_value) != len(node.key):
+                    E(
+                        f"node {nid} {ct} host value len={len(cd.host_value)} "
+                        f"!= key_len={len(node.key)}"
+                    )
 
             # Full is the tree backbone, so aux data requires Full data.
             for ct in self.tree_components:

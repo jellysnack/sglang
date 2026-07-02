@@ -527,7 +527,7 @@ class SchedulerDisaggregationPrefillMixin:
             if batch:
                 if self.enable_staging:
                     self.maybe_prefetch_staging_for_batch(batch)
-                result = self.run_batch(batch)
+                result = self.run_batch_with_swa_recompute_cleanup(batch)
                 self.process_batch_result(batch, result)
             else:
                 self.on_idle()
@@ -565,7 +565,7 @@ class SchedulerDisaggregationPrefillMixin:
             if batch:
                 if self.enable_staging:
                     self.maybe_prefetch_staging_for_batch(batch)
-                batch_result = self.run_batch(batch)
+                batch_result = self.run_batch_with_swa_recompute_cleanup(batch)
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None

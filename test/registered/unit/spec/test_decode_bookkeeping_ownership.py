@@ -55,6 +55,7 @@ _OWNER_SITES = {
     (_SB, "ScheduleBatch.prepare_for_extend", "kv_committed_len"): 1,
     (_SB, "ScheduleBatch.prepare_for_extend", "kv_allocated_len"): 1,
     ("mem_cache/common.py", "alloc_for_extend", "evict"): 1,
+    ("mem_cache/common.py", "alloc_for_extend_swa_recompute", "evict"): 1,
     ("mem_cache/common.py", "alloc_for_decode", "evict"): 1,
     # spec v2: no pre-claim; resolve commits the full accepted run uniformly.
     (*_EAGLE_DECODE, "decode_batch_idx"): 1,

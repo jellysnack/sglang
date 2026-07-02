@@ -190,6 +190,8 @@ def build_swa_token_ids(
     req_to_token: torch.Tensor,
     full_to_swa: torch.Tensor,
     swa_window: int,
+    swa_out_cache_loc_override: Optional[torch.Tensor] = None,
+    extend_start_loc: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build a flat list of physical SWA-cache token IDs covering each
     request's positional union of every query's SWA window.
@@ -199,7 +201,9 @@ def build_swa_token_ids(
     ``min(seq_len, extend + W - 1)``. Each position is translated through
     ``req_to_token`` (full kv-cache id) and then ``full_to_swa`` (SWA
     cache id) to land in the SWA-cache token-id space that
-    ``dequantize_k_cache_paged`` consumes.
+    ``dequantize_k_cache_paged`` consumes. When
+    ``swa_out_cache_loc_override`` is set, positions inside the current extend
+    chunk use that batch-local COW SWA target instead of the global mapping.
 
     Args:
         seq_lens: (num_reqs,) int32, per-request total sequence length.
@@ -239,9 +243,22 @@ def build_swa_token_ids(
     if total_swa == 0:
         return swa_token_ids, swa_first_pos, swa_gather_lens, swa_offsets
 
+    has_override = swa_out_cache_loc_override is not None
+    if has_override:
+        assert extend_start_loc is not None
+        swa_out_cache_loc_override = swa_out_cache_loc_override.to(torch.int32)
+        extend_start_loc = extend_start_loc.to(torch.int32)
+    else:
+        swa_out_cache_loc_override = torch.empty(
+            0, dtype=torch.int32, device=seq_lens.device
+        )
+        extend_start_loc = torch.empty(0, dtype=torch.int32, device=seq_lens.device)
+
     NUM_WORKERS = 128
     _build_swa_token_ids_kernel[(num_reqs, NUM_WORKERS)](
         swa_token_ids,
+        seq_lens,
+        extend_seq_lens,
         swa_first_pos,
         swa_gather_lens,
         swa_offsets,
@@ -249,6 +266,9 @@ def build_swa_token_ids(
         req_to_token,
         req_to_token.stride(0),
         full_to_swa,
+        swa_out_cache_loc_override,
+        extend_start_loc,
+        HAS_OVERRIDE=has_override,
     )
     return swa_token_ids, swa_first_pos, swa_gather_lens, swa_offsets
 
@@ -256,6 +276,8 @@ def build_swa_token_ids(
 @triton.jit
 def _build_swa_token_ids_kernel(
     out_ptr,
+    seq_lens_ptr,
+    extend_seq_lens_ptr,
     swa_first_pos_ptr,
     swa_gather_lens_ptr,
     swa_offsets_ptr,
@@ -263,6 +285,9 @@ def _build_swa_token_ids_kernel(
     req_to_token_ptr,
     req_to_token_stride,
     full_to_swa_ptr,
+    swa_override_ptr,
+    extend_start_loc_ptr,
+    HAS_OVERRIDE: tl.constexpr,
 ):
     batch_idx = tl.program_id(0)
     worker_id = tl.program_id(1)
@@ -272,6 +297,10 @@ def _build_swa_token_ids_kernel(
     gather_len = tl.load(swa_gather_lens_ptr + batch_idx)
     out_off = tl.load(swa_offsets_ptr + batch_idx).to(tl.int64)
     req_pool_idx = tl.load(req_pool_indices_ptr + batch_idx).to(tl.int64)
+    seq_len = tl.load(seq_lens_ptr + batch_idx)
+    extend_len = tl.load(extend_seq_lens_ptr + batch_idx)
+    prefix_len = seq_len - extend_len
+    extend_start = tl.load(extend_start_loc_ptr + batch_idx) if HAS_OVERRIDE else 0
 
     for i in range(worker_id, gather_len, num_workers):
         pos = first_pos + i
@@ -279,6 +308,13 @@ def _build_swa_token_ids_kernel(
             req_to_token_ptr + req_pool_idx * req_to_token_stride + pos
         ).to(tl.int64)
         swa_id = tl.load(full_to_swa_ptr + full_id).to(tl.int32)
+        if HAS_OVERRIDE:
+            override_idx = extend_start + pos - prefix_len
+            in_extend = pos >= prefix_len
+            override_swa_id = tl.load(
+                swa_override_ptr + override_idx, mask=in_extend, other=0
+            ).to(tl.int32)
+            swa_id = tl.where(in_extend, override_swa_id, swa_id)
         tl.store(out_ptr + out_off + i, swa_id)
 
 
@@ -420,6 +456,8 @@ class SparsePrefillChunkCache:
         swa_page_size: int,
         num_qo_tokens: int,
         max_seq_len: int,
+        swa_out_cache_loc_override: Optional[torch.Tensor] = None,
+        extend_start_loc: Optional[torch.Tensor] = None,
     ) -> "SparsePrefillChunkCache":
         device = seq_lens.device
         num_reqs = seq_lens.shape[0]
@@ -435,6 +473,8 @@ class SparsePrefillChunkCache:
                 req_to_token=req_to_token,
                 full_to_swa=full_to_swa,
                 swa_window=swa_window_size,
+                swa_out_cache_loc_override=swa_out_cache_loc_override,
+                extend_start_loc=extend_start_loc,
             )
         )
 

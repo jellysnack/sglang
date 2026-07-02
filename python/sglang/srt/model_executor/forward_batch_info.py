@@ -348,6 +348,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     out_cache_loc: torch.Tensor
     # The sum of all sequence lengths
     seq_lens_sum: int
+    # Optional SWA write-target override for SWA-window recompute COW pages.
+    swa_out_cache_loc_override: Optional[torch.Tensor] = None
 
     # === Borrowed from ScheduleBatch: GPU tensors (cross-stream; clone targets for stream isolation) ===
     # FIXME(lsyin): these are currently aliased by reference from ScheduleBatch. Once
@@ -502,6 +504,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     dp_local_start_pos: Optional[torch.Tensor] = None  # cached info at runtime
     dp_local_num_tokens: Optional[torch.Tensor] = None  # cached info at runtime
     global_dp_buffer_len: Optional[int] = None
+    # Per-req boundary P below which recompute suppresses compressed-KV writes.
+    swa_recompute_boundaries: Optional[List[int]] = None
 
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
@@ -693,6 +697,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             seq_lens=batch.seq_lens,
             out_cache_loc=batch.out_cache_loc,
             seq_lens_sum=batch.seq_lens_sum,
+            swa_out_cache_loc_override=batch.swa_out_cache_loc_override,
             # Inputs aliased by reference from ScheduleBatch
             seq_lens_cpu=seq_lens_cpu,
             orig_seq_lens=batch.orig_seq_lens,
@@ -716,6 +721,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             can_run_dp_breakable_cuda_graph=batch.can_run_dp_breakable_cuda_graph,
             global_forward_mode=batch.global_forward_mode,
             is_prefill_only=batch.is_prefill_only,
+            swa_recompute_boundaries=batch.swa_recompute_boundaries,
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=capture_hidden_mode,
             return_hidden_states_before_norm=return_hidden_states_before_norm,
@@ -1359,6 +1365,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
 
         self.out_cache_loc = self._pad_tensor_to_size(self.out_cache_loc, num_tokens)
+        if self.swa_out_cache_loc_override is not None:
+            self.swa_out_cache_loc_override = self._pad_tensor_to_size(
+                self.swa_out_cache_loc_override, num_tokens
+            )
         if self.encoder_lens is not None:
             self.encoder_lens = self._pad_tensor_to_size(self.encoder_lens, bs)
         self.positions = self._pad_tensor_to_size(self.positions, num_tokens)

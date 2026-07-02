@@ -634,6 +634,23 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         self.assertCountEqual([e.block_hashes[0] for e in restored_gpu], stored_hashes)
 
 
+class TestUnifiedSWARecomputeWindowSizing(CustomTestCase):
+    def test_window_covers_page_aligned_committed_tail(self):
+        cfg = CacheConfig(
+            page_size=256,
+            components=(ComponentType.FULL, ComponentType.SWA),
+            sliding_window_size=128,
+            kv_size=8192,
+            max_context_len=8192,
+        )
+        tree, _, _ = build_fixture(cfg)
+        swa = tree.components[ComponentType.SWA]
+        swa.swa_num_layers = 42
+
+        self.assertEqual(tree._swa_recompute_window_size(), 5632)
+        self.assertEqual(swa.swa_recompute_gate_threshold(), 11264)
+
+
 class UnifiedRadixCacheSuite:
 
     cfg: CacheConfig
@@ -2207,6 +2224,198 @@ class UnifiedRadixCacheSuite:
         extra = self._make_seq(9000, 2)
         self._insert(cache, allocator, req_to_token_pool, extra)
         cache.sanity_check()
+
+    # ================================================================
+    # SWA-window recompute (SGLANG_OPT_SWA_RECOMPUTE_WINDOW)
+    # ================================================================
+
+    def _enable_swa_recompute(self, tree):
+        """Set the SWA layer count used by recompute window sizing."""
+        swa = tree.components[ComponentType.SWA]
+        swa.swa_num_layers = 1
+        return swa
+
+    def test_swa_recompute_zero_when_all_live(self):
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA component")
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._enable_swa_recompute(tree)
+        seq = self._make_seq(1, 4)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+
+        with envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.override(True):
+            result = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        self.assertEqual(result.swa_recompute_len, 0)
+        self.assertEqual(result.device_indices.shape[0], len(seq))
+
+    def test_swa_recompute_uses_host_swa_without_recompute(self):
+        """Host SWA is a valid hit and should not force recompute."""
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA component")
+        if self.cfg.has_mamba:
+            self.skipTest("SWA-only path keeps the setup simple")
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._enable_swa_recompute(tree)
+        n_pages = 4
+        seq = self._make_seq(1, n_pages)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        leaf = m.last_device_node
+        self.assertIsNot(leaf, tree.root_node, "need at least one matched node")
+        cd_full = leaf.component_data[ComponentType.FULL]
+        self.assertIsNotNone(cd_full.value)
+        cd_swa = leaf.component_data[ComponentType.SWA]
+        self.assertIsNotNone(cd_swa.value)
+        cd_full.host_value = cd_full.value.clone()
+        cd_full.value = None
+        cd_swa.host_value = cd_swa.value.clone()
+        cd_swa.value = None
+
+        with envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.override(True):
+            result = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+
+        self.assertEqual(result.swa_recompute_len, 0)
+        self.assertGreater(result.host_hit_length, 0)
+        self.assertGreater(result.swa_host_hit_length, 0)
+
+    def test_swa_recompute_arms_on_host_full_missing_swa_tail(self):
+        """Host/storage FULL hit with no SWA tail must arm recompute."""
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA component")
+        if self.cfg.has_mamba:
+            self.skipTest("SWA-only path keeps the setup simple")
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        swa = self._enable_swa_recompute(tree)
+        page_size = self.cfg.page_size
+        gate_pages = (swa.swa_recompute_gate_threshold() + page_size - 1) // page_size
+        n_pages = gate_pages + 1
+        seq = self._make_seq(1, n_pages)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        leaf = m.last_device_node
+        self.assertIsNot(leaf, tree.root_node, "need at least one matched node")
+        cd_full = leaf.component_data[ComponentType.FULL]
+        self.assertIsNotNone(cd_full.value)
+        cd_full.host_value = cd_full.value.clone()
+        cd_full.value = None
+        cd_swa = leaf.component_data[ComponentType.SWA]
+        cd_swa.value = None
+        cd_swa.host_value = None
+
+        with envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.override(True):
+            result = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+
+        self.assertGreater(result.swa_recompute_len, 0)
+        self.assertGreater(result.host_hit_length, 0)
+        self.assertEqual(result.swa_host_hit_length, 0)
+
+    def test_swa_recompute_gated_host_full_missing_swa_falls_back(self):
+        """Short host FULL hits without SWA must not become unsafe hits."""
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA component")
+        if self.cfg.has_mamba:
+            self.skipTest("SWA-only path keeps the setup simple")
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._enable_swa_recompute(tree)
+        seq = self._make_seq(1, 1)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        leaf = m.last_device_node
+        self.assertIsNot(leaf, tree.root_node, "need at least one matched node")
+        cd_full = leaf.component_data[ComponentType.FULL]
+        cd_full.host_value = cd_full.value.clone()
+        cd_full.value = None
+        cd_swa = leaf.component_data[ComponentType.SWA]
+        cd_swa.value = None
+        cd_swa.host_value = None
+
+        with envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.override(True):
+            result = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+
+        self.assertEqual(result.swa_recompute_len, 0)
+        self.assertEqual(result.host_hit_length, 0)
+        self.assertEqual(len(result.device_indices), 0)
+
+    def test_hicache_swa_load_back_requires_armed_recompute_for_missing_swa(self):
+        """LOAD_BACK must not silently skip missing SWA unless recompute is armed."""
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA component")
+        if self.cfg.has_mamba:
+            self.skipTest("SWA-only path keeps the setup simple")
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._enable_swa_recompute(tree)
+        seq = self._make_seq(1, 2)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        leaf = m.last_device_node
+        cd_full = leaf.component_data[ComponentType.FULL]
+        cd_full.host_value = cd_full.value.clone()
+        cd_swa = leaf.component_data[ComponentType.SWA]
+        cd_swa.value = None
+        cd_swa.host_value = None
+        swa_comp = tree.components[ComponentType.SWA]
+
+        with envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.override(True):
+            with self.assertRaises(AssertionError):
+                swa_comp.build_hicache_transfers(
+                    leaf, CacheTransferPhase.LOAD_BACK, req=None
+                )
+
+            req = self._make_req(req_to_token_pool)
+            req.swa_recompute_len = swa_comp.swa_recompute_window_size()
+            self.assertIsNone(
+                swa_comp.build_hicache_transfers(
+                    leaf, CacheTransferPhase.LOAD_BACK, req=req
+                )
+            )
+
+    def test_swa_recompute_materializes_host_only_tail(self):
+        """Fresh recompute commit must turn host-only SWA into device SWA."""
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA component")
+        if self.cfg.has_mamba:
+            self.skipTest("SWA-only path keeps the setup simple")
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._enable_swa_recompute(tree)
+        seq = self._make_seq(1, 2)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        leaf = m.last_device_node
+        self.assertIsNot(leaf, tree.root_node, "need at least one matched node")
+        cd_full = leaf.component_data[ComponentType.FULL]
+        cd_swa = leaf.component_data[ComponentType.SWA]
+        self.assertIsNotNone(cd_full.value)
+        self.assertIsNotNone(cd_swa.value)
+
+        cd_swa.host_value = cd_swa.value.clone()
+        tree._evict_component_and_detach_lru(
+            leaf,
+            tree.components[ComponentType.SWA],
+            target=EvictLayer.DEVICE,
+        )
+        self.assertIsNone(cd_swa.value)
+        self.assertIsNotNone(cd_swa.host_value)
+        self.assertTrue(tree.host_lru_lists[ComponentType.SWA].in_list(leaf))
+
+        fresh_swa = allocator.alloc_fresh_swa_for_recompute_window(cd_full.value)
+        self.assertIsNotNone(fresh_swa)
+        allocator.commit_fresh_swa_for_recompute_window(cd_full.value, fresh_swa)
+        materialized = tree.revive_swa_tombstone_window(leaf, len(cd_full.value))
+
+        self.assertEqual(materialized, len(cd_full.value))
+        self.assertIsNotNone(cd_swa.value)
+        self.assertTrue(
+            torch.equal(
+                cd_swa.value,
+                allocator.translate_loc_from_full_to_swa(cd_full.value),
+            )
+        )
+        self.assertFalse(tree.host_lru_lists[ComponentType.SWA].in_list(leaf))
 
     # ================================================================
     # HiCache Unit Tests (real cache_controller D<->H backup/load)

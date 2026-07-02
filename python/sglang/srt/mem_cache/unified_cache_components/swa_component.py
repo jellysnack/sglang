@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
@@ -57,6 +58,10 @@ class SWAComponent(TreeComponent):
         ), f"SWAComponent requires SWATokenToKVPoolAllocator, got {type(cache.token_to_kv_pool_allocator)}"
         super().__init__(cache, params)
         self.sliding_window_size = params.sliding_window_size
+        # Used to size the SWA-window recompute window W_r. Only required when
+        # SGLANG_OPT_SWA_RECOMPUTE_WINDOW is enabled; the cache builder enforces
+        # it there.
+        self.swa_num_layers = params.swa_num_layers
         # HiCache state: set to host SWA pool when HiCache enabled
         self._swa_kv_pool_host = None
 
@@ -113,6 +118,57 @@ class SWAComponent(TreeComponent):
         allocator.full_to_swa_index_mapping[incoming_full_value.to(torch.int64)] = 0
         allocator.full_attn_allocator.free(incoming_full_value)
         self._restore_device_value(node, swa_value)
+
+    # ---- SWA-window recompute ----
+
+    def swa_recompute_window_size(self) -> int:
+        """Page-aligned trailing recompute window."""
+        assert (
+            self.swa_num_layers and self.swa_num_layers > 0
+        ), "swa_num_layers must be set for SWA-window recompute"
+        page = self.cache.page_size
+        commit_tail = (self.sliding_window_size + page - 1) // page * page
+        n = commit_tail + (self.swa_num_layers - 1) * self.sliding_window_size
+        return (n + page - 1) // page * page
+
+    def swa_recompute_gate_threshold(self) -> int:
+        """Min matched-prefix length to take the recompute path."""
+        return 2 * self.swa_recompute_window_size()
+
+    def is_swa_recompute_tombstone(self, node: UnifiedTreeNode) -> bool:
+        """True iff FULL is reusable but SWA is absent on both device and host."""
+        if node is self.cache.root_node:
+            return False
+        cd_full = node.component_data[BASE_COMPONENT_TYPE]
+        if cd_full.value is None and cd_full.host_value is None:
+            return False
+        cd = node.component_data[self.component_type]
+        return cd.value is None and cd.host_value is None
+
+    def materialize_recompute_device_value(self, node: UnifiedTreeNode) -> bool:
+        """Ensure a recomputed SWA segment has a live device value."""
+        ct = self.component_type
+        cd_full = node.component_data[BASE_COMPONENT_TYPE]
+        cd = node.component_data[ct]
+        assert (
+            cd_full.value is not None
+        ), f"SWA recompute materialize on node with no FULL value, node={node.id}"
+        if cd.value is not None:
+            return False
+        assert cd.lock_ref == 0, (
+            f"{ct} lock_ref must be 0 on SWA recompute materialize, "
+            f"got {cd.lock_ref}, node={node.id}"
+        )
+        swa_value = self._translate_full_to_swa(cd_full.value)
+        self._restore_device_value(node, swa_value)
+        return True
+
+    def revive_tombstoned_node(self, node: UnifiedTreeNode) -> None:
+        """Flip a single recompute tombstone back to live."""
+        assert self.is_swa_recompute_tombstone(
+            node
+        ), f"revive on non-tombstone node, node={node.id}"
+        self.materialize_recompute_device_value(node)
 
     def create_match_validator(
         self, match_device_only: bool = False
@@ -418,25 +474,36 @@ class SWAComponent(TreeComponent):
         self, params: EvictParams, tracker: dict[ComponentType, int]
     ) -> None:
         request = params.swa_num_tokens
+        if request <= 0:
+            return
         ct = self.component_type
         lru = self.cache.lru_lists[ct]
+        recompute_mode = envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.get()
         x = lru.get_lru_no_lock()
         while tracker[ct] < request and x is not None and lru.in_list(x):
             assert x.component_data[ct].value is not None
             if x in self.cache.evictable_device_leaves:
-                # D-leaf: atomic eviction of all components
                 x_next = lru.get_prev_no_lock(x)
-                self.cache._evict_device_leaf(x, tracker)
+                if recompute_mode:
+                    # Drop SWA only; FULL pressure can still evict the leaf.
+                    assert x.component_data[BASE_COMPONENT_TYPE].lock_ref == 0
+                    self.cache._evict_component_and_detach_lru(
+                        x, self, target=EvictLayer.DEVICE, tracker=tracker
+                    )
+                else:
+                    self.cache._evict_device_leaf(x, tracker)
                 if not lru.in_list(x_next):
                     x_next = lru.get_lru_no_lock()
                 x = x_next
             else:
-                # Internal: tombstone SWA + cascade
+                # Internal node: SWA tombstone + cascade.
                 x_next = lru.get_prev_no_lock(x)
                 self.cache._evict_component_and_detach_lru(
                     x, self, target=EvictLayer.DEVICE, tracker=tracker
                 )
                 self.cache._cascade_evict(x, self, tracker)
+                if not lru.in_list(x_next):
+                    x_next = lru.get_lru_no_lock()
                 x = x_next
 
     def acquire_component_lock(
@@ -453,9 +520,9 @@ class SWAComponent(TreeComponent):
         uuid_key = "host_uuid" if lock_host else "uuid"
         lru = self.cache.host_lru_lists[ct] if lock_host else self.cache.lru_lists[ct]
 
-        # Tombstoned nodes (cd.value is None) have no SWA chunk to protect
-        # skip them and keep walking up. This path is hit when HiCache
-        # backs up a FULL present internal node whose SWA was already evicted.
+        # Tombstoned ancestors (cd.value is None) have no SWA chunk to protect;
+        # walk past them. Hit when HiCache backs up a FULL-alive internal node
+        # whose SWA was already evicted.
         cur = node
         while cur != root and swa_lock_size < sliding_window_size:
             comp = cur.component_data[ct]
@@ -638,23 +705,34 @@ class SWAComponent(TreeComponent):
             ]
 
         if phase == CacheTransferPhase.LOAD_BACK:
-            # `node` is best_match_node; the SWA validator guarantees every
-            # ancestor within `sliding_window_size` has value or host_value.
+            if req is not None and max(0, int(req.swa_recompute_len)) > 0:
+                # The recompute forward rewrites the full trailing SWA window
+                # into fresh pages, so host SWA load-back would be redundant.
+                return None
+
+            # Walk up from best_match_node summing SWA window coverage. Active
+            # recompute returned above, so any missing SWA segment here would
+            # make a FULL load-back unsafe.
             n_swa = 0
             backed_up: list[torch.Tensor] = []
             nodes: list = []
             cur = node
             while cur is not self.cache.root_node and n_swa < self.sliding_window_size:
                 cd = cur.component_data[ct]
-                assert cd.host_value is not None or cd.value is not None
                 if cd.value is not None:
-                    # device exists, skip it
+                    # device exists, skip
                     n_swa += len(cd.value)
-                else:
-                    # host only, collect it
+                elif cd.host_value is not None:
+                    # host only, collect
                     backed_up.append(cd.host_value)
                     nodes.append(cur)
                     n_swa += len(cd.host_value)
+                else:
+                    raise AssertionError(
+                        "SWA LOAD_BACK saw a node with no SWA device/host value "
+                        "without active SWA recompute, "
+                        f"node={cur.id}"
+                    )
                 cur = cur.parent
 
             if not backed_up:
