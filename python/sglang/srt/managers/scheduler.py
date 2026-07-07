@@ -1058,127 +1058,48 @@ class Scheduler(
                 "SWA-window recompute feature."
             )
 
-    def _prepare_swa_recompute_waiting_queue_across_cp(self) -> Optional[int]:
-        """Make SWA-recompute admission deterministic across CP ranks.
-
-        SWA cache state is local to each CP rank, so one rank can see a normal
-        SWA hit while another must recompute the same prefix tail. CP forward
-        needs the same request order and the same recompute window on every
-        rank, so synchronize the queue before admission starts.
-        """
+    def _debug_assert_swa_recompute_admission_consistent_across_cp(
+        self, can_run_list: List[Req]
+    ) -> None:
         if (
-            not envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.get()
+            not envs.SGLANG_DEBUG_SWA_RECOMPUTE_CP_ADMISSION.get()
+            or not envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.get()
             or self.ps.attn_cp_size <= 1
             or not isinstance(self.tree_cache, UnifiedRadixCache)
         ):
-            return None
-        if not self.waiting_queue:
-            return None
+            return
 
-        # Phase 1: collect each rank's queue with per-request prefetch
-        # readiness. The rid set must match on every rank; the order may differ
-        # because cache-aware priority can observe rank-local SWA state.
-        if self.enable_hicache_storage:
-            # Complete ready L3 prefetches before prefix matching. Requests
-            # whose prefetch is still pending on some rank are left for the
-            # next scheduler round, so admission never consumes a newly
-            # completed prefetch with a stale recompute decision.
-            local_ready = [
-                (req.rid, bool(self.tree_cache.check_prefetch_progress(req.rid)))
-                for req in self.waiting_queue
-            ]
-        else:
-            local_ready = [(req.rid, True) for req in self.waiting_queue]
-        gathered_ready: List[List[Tuple[str, bool]]] = [
+        local_summary = [
+            (
+                req.rid,
+                len(req.prefix_indices),
+                int(req.extend_range.length),
+                int(req.extend_range.end),
+                int(req.swa_recompute_len),
+                int(req.host_hit_length),
+                int(req.swa_host_hit_length),
+                int(req.mamba_host_hit_length),
+                int(getattr(req, "storage_hit_length", 0)),
+                int(getattr(req, "cache_protected_len", 0)),
+                getattr(req.last_node, "id", None),
+                getattr(req.best_match_node, "id", None),
+                getattr(req.last_host_node, "id", None),
+            )
+            for req in can_run_list
+        ]
+        gathered: List[List[Tuple[Any, ...]]] = [
             [] for _ in range(self.ps.attn_cp_size)
         ]
         torch.distributed.all_gather_object(
-            gathered_ready, local_ready, group=self.attn_cp_cpu_group
+            gathered, local_summary, group=self.attn_cp_cpu_group
         )
-
-        canonical_rids = [rid for rid, _ in gathered_ready[0]]
-        ready_by_rank = [dict(rank_items) for rank_items in gathered_ready]
-        for rank_ready in ready_by_rank:
-            if rank_ready.keys() != set(canonical_rids):
+        reference = gathered[0]
+        for rank, summary in enumerate(gathered[1:], start=1):
+            if summary != reference:
                 raise AssertionError(
-                    "SWA-window recompute CP sync found different waiting "
-                    f"queues: rank_rids={sorted(rank_ready)}, "
-                    f"canonical_rids={canonical_rids}"
+                    "SWA-window recompute CP admission diverged: "
+                    f"rank0={reference}, rank{rank}={summary}"
                 )
-
-        # Rank 0's order becomes the canonical order for this scheduler round.
-        local_by_rid = {req.rid: req for req in self.waiting_queue}
-        self.waiting_queue = [local_by_rid[rid] for rid in canonical_rids]
-
-        ready_count = 0
-        for rid in canonical_rids:
-            if not all(rank_ready[rid] for rank_ready in ready_by_rank):
-                break
-            ready_count += 1
-
-        # Phase 2: run local prefix matching in the canonical order. This fills
-        # req.swa_recompute_len from the local SWA cache state.
-        candidate_reqs = self.waiting_queue[:ready_count]
-        for req in candidate_reqs:
-            req.init_next_round_input(self.tree_cache)
-
-        # Phase 3: synchronize the recompute decision. If any rank needs to
-        # rebuild a request's SWA tail, all ranks use that same window.
-        local_windows = [
-            (max(0, int(req.swa_recompute_len)), max(0, int(req.host_hit_length)))
-            for req in candidate_reqs
-        ]
-        gathered_windows: List[List[Tuple[int, int]]] = [
-            [] for _ in range(self.ps.attn_cp_size)
-        ]
-        torch.distributed.all_gather_object(
-            gathered_windows, local_windows, group=self.attn_cp_cpu_group
-        )
-
-        synced_recompute_lens = [0] * ready_count
-        any_host_hit = [False] * ready_count
-        for rank_windows in gathered_windows:
-            assert len(rank_windows) == ready_count, (
-                "SWA-window recompute CP sync found different candidate "
-                f"counts: {len(rank_windows)=}, {ready_count=}"
-            )
-            for i, (recompute_len, host_hit_length) in enumerate(rank_windows):
-                synced_recompute_lens[i] = max(synced_recompute_lens[i], recompute_len)
-                any_host_hit[i] = any_host_hit[i] or host_hit_length > 0
-
-        # Phase 4: apply the synchronized window before PrefillAdder admission.
-        for i, req in enumerate(candidate_reqs):
-            synced_recompute_len = synced_recompute_lens[i]
-            if synced_recompute_len == 0:
-                continue
-
-            # If the synchronized recompute window would depend on HiCache FULL
-            # load-back on any rank, fall back to cold prefill on all CP ranks.
-            # This keeps prefix lengths and input tensors identical even if a
-            # later host/storage load-back would complete differently per rank.
-            if any_host_hit[i]:
-                req.reset_swa_recompute_to_cold_prefill(self.tree_cache.root_node)
-                continue
-
-            local_recompute_len = max(0, int(req.swa_recompute_len))
-            if synced_recompute_len == local_recompute_len:
-                continue
-
-            matched_prefix_len = len(req.prefix_indices) + req.host_hit_length
-            assert synced_recompute_len <= matched_prefix_len, (
-                "SWA-window recompute CP sync produced a recompute window larger "
-                f"than the local prefix: rid={req.rid}, "
-                f"local_recompute_len={local_recompute_len}, "
-                f"synced_recompute_len={synced_recompute_len}, "
-                f"device_prefix_len={len(req.prefix_indices)}, "
-                f"host_hit_length={req.host_hit_length}"
-            )
-            # If any rank lost the SWA tail, every rank recomputes the same tail
-            # into private SWA pages.
-            req.swa_recompute_len = synced_recompute_len
-            req.swa_host_hit_length = 0
-
-        return len(candidate_reqs)
 
     def init_schedule_policy(self):
         # Init schedule policy and new token estimation
@@ -3038,10 +2959,6 @@ class Scheduler(
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
-        prepared_waiting_queue_count = (
-            self._prepare_swa_recompute_waiting_queue_across_cp()
-        )
-
         if self.enable_lora:
             running_loras = {
                 req.lora_id for req in running_batch.reqs if not req.finished()
@@ -3059,12 +2976,7 @@ class Scheduler(
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         # Get requests from the waiting queue to a new prefill batch
-        waiting_queue_candidates = (
-            self.waiting_queue
-            if prepared_waiting_queue_count is None
-            else self.waiting_queue[:prepared_waiting_queue_count]
-        )
-        for req in waiting_queue_candidates:
+        for req in self.waiting_queue:
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
 
@@ -3094,8 +3006,7 @@ class Scheduler(
                 if loaded_tokens > 0:
                     req.storage_hit_length = loaded_tokens
 
-            if prepared_waiting_queue_count is None:
-                req.init_next_round_input(self.tree_cache)
+            req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
@@ -3138,6 +3049,7 @@ class Scheduler(
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
+        self._debug_assert_swa_recompute_admission_consistent_across_cp(can_run_list)
         if len(can_run_list) == 0:
             return None, running_batch
 

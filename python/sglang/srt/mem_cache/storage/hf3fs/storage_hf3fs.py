@@ -691,6 +691,8 @@ class HiCacheHF3FS(HiCacheStorage):
             pool_name = transfer.name
             ctx = self._pool_storage_ctx.get(pool_name)
             if ctx is None:
+                if transfer.hit_policy == PoolHitPolicy.OPTIONAL_TRAILING_PAGES:
+                    continue
                 final_pages = 0
                 break
 
@@ -705,7 +707,10 @@ class HiCacheHF3FS(HiCacheStorage):
                     boundary = exists_results.index(False)
                 except ValueError:
                     boundary = kv_pages
-            elif transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
+            elif transfer.hit_policy in (
+                PoolHitPolicy.TRAILING_PAGES,
+                PoolHitPolicy.OPTIONAL_TRAILING_PAGES,
+            ):
                 trailing = max(1, len(transfer.keys) if transfer.keys else 1)
                 for prefix_len in range(kv_pages, 0, -1):
                     if all(
@@ -717,7 +722,8 @@ class HiCacheHF3FS(HiCacheStorage):
 
             if boundary:
                 hit_count[pool_name] = boundary
-            final_pages = min(final_pages, boundary)
+            if transfer.hit_policy != PoolHitPolicy.OPTIONAL_TRAILING_PAGES:
+                final_pages = min(final_pages, boundary)
 
         return PoolTransferResult(final_pages, hit_count)
 

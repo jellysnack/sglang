@@ -49,6 +49,8 @@ class CacheInitParams:
     # SWA layer count used to size the recompute window. Only set for hybrid SWA.
     swa_num_layers: Optional[int] = None
 
+    swa_checkpoint_interval: int = 0
+
     # Time-to-live for cache entries in seconds. If None, TTL is disabled.
     cache_ttl_seconds: Optional[float] = None
 
