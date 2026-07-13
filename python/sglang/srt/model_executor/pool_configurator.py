@@ -29,11 +29,13 @@ from sglang.srt.configs.model_config import (
     is_minimax_sparse,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.cp.utils import is_cp_cache_layer_split_enabled
 from sglang.srt.mem_cache.common import get_alloc_len_per_decode
 from sglang.srt.mem_cache.cp_cache_layer_split import (
     build_cp_cache_layer_split_deepseek_v4_worst_case_pool_layout,
     cp_cache_layer_split_sharding_flags,
+)
+from sglang.srt.mem_cache.cp_cache_layer_split.utils import (
+    should_use_cp_cache_layer_split_pool,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
@@ -182,13 +184,19 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         # args to config cell size
         model_config = mr.model_config
         kv_cache_dtype = mr.kv_cache_dtype
-        from sglang.srt.layers.cp.utils import (
-            get_glm_dsa_layer_split_effective_num_layers,
-        )
+        effective_num_layers = num_layers
+        if (
+            should_use_cp_cache_layer_split_pool(mr)
+            and mr.use_mla_backend
+            and is_deepseek_dsa(model_config.hf_config)
+        ):
+            from sglang.srt.mem_cache.dsa_cache_layer_split import (
+                get_dsa_layer_split_effective_num_layers,
+            )
 
-        effective_num_layers = get_glm_dsa_layer_split_effective_num_layers(
-            mr, num_layers
-        )
+            effective_num_layers = get_dsa_layer_split_effective_num_layers(
+                num_layers, get_parallel().attn_cp_size
+            )
 
         kv_size = torch._utils._element_size(kv_cache_dtype)
         tp_size = get_parallel().attn_tp_size
@@ -541,7 +549,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.compress_ratios = cfg.compress_ratios
         self.start_layer = mr.start_layer
         self.end_layer = mr.end_layer
-        self.use_cp_cache_layer_split = is_cp_cache_layer_split_enabled(mr.server_args)
+        self.use_cp_cache_layer_split = should_use_cp_cache_layer_split_pool(mr)
         self.attn_cp_size = mr.server_args.attn_cp_size
         # PP-local slice; matches DeepSeekV4TokenToKVPool's stage_ratios.
         self.compression_ratios = cfg.compress_ratios[mr.start_layer : mr.end_layer]

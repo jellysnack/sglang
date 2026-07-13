@@ -16,13 +16,10 @@ from sglang.srt.configs.model_config import (
     is_minimax_sparse,
 )
 from sglang.srt.distributed.parallel_state import (
-    get_attn_context_model_parallel_rank,
-    get_attn_context_model_parallel_world_size,
     get_attn_cp_group,
     get_world_group,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.cp.utils import is_cp_cache_layer_split_enabled
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
@@ -38,6 +35,10 @@ from sglang.srt.mem_cache.allocator.swa import (
 from sglang.srt.mem_cache.common import get_req_to_token_extra_context_len
 from sglang.srt.mem_cache.cp_cache_layer_split.deepseek_v4_pool import (
     CpCacheLayerSplitDeepSeekV4TokenToKVPool,
+)
+from sglang.srt.mem_cache.cp_cache_layer_split.utils import (
+    get_cp_cache_layer_shard_info,
+    should_use_cp_cache_layer_split_pool,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
@@ -830,10 +831,11 @@ class ModelRunnerKVCacheMixin:
                     self.server_args.max_speculative_num_draft_tokens or 0
                 ),
             )
-            if is_cp_cache_layer_split_enabled(self.server_args):
+            layer_shard_rank, layer_shard_size = get_cp_cache_layer_shard_info(self)
+            if layer_shard_rank is not None:
                 self.token_to_kv_pool = CpCacheLayerSplitDeepSeekV4TokenToKVPool(
-                    cp_rank=get_attn_context_model_parallel_rank(),
-                    cp_size=get_attn_context_model_parallel_world_size(),
+                    cp_rank=layer_shard_rank,
+                    cp_size=layer_shard_size,
                     cp_cache_layer_split_staging_context_len=(
                         self.model_config.context_len
                     ),
@@ -973,12 +975,10 @@ class ModelRunnerKVCacheMixin:
                     end_layer=self.end_layer,
                 )
         elif self.use_mla_backend and is_dsa_model:
-            from sglang.srt.layers.cp.utils import get_glm_dsa_cp_layer_shard_info
-
             (
                 dsa_cp_layer_shard_rank,
                 dsa_cp_layer_shard_size,
-            ) = get_glm_dsa_cp_layer_shard_info(self)
+            ) = get_cp_cache_layer_shard_info(self)
             pool_kwargs = {}
             if self.enable_hisparse:
                 PoolCls = HiSparseDSATokenToKVPool
@@ -1370,7 +1370,7 @@ class ModelRunnerKVCacheMixin:
 
         # Keep capacity identical across CP ranks so sharded pools and
         # dynamically grown staging buffers use a consistent capacity bound.
-        if is_cp_cache_layer_split_enabled(self.server_args):
+        if should_use_cp_cache_layer_split_pool(self):
             tensor = torch.tensor(token_capacity, dtype=torch.int64)
             torch.distributed.all_reduce(
                 tensor,
