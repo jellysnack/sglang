@@ -15,13 +15,14 @@ from sglang.srt.configs.model_config import (
     is_deepseek_v4,
     is_minimax_sparse,
 )
-from sglang.srt.distributed.parallel_state import get_world_group
-from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import (
-    get_attention_cp_group,
-    get_attention_cp_rank,
-    get_attention_cp_size,
+from sglang.srt.distributed.parallel_state import (
+    get_attn_context_model_parallel_rank,
+    get_attn_context_model_parallel_world_size,
+    get_attn_cp_group,
+    get_world_group,
 )
+from sglang.srt.environ import envs
+from sglang.srt.layers.cp.utils import is_cp_cache_layer_split_enabled
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
@@ -35,9 +36,8 @@ from sglang.srt.mem_cache.allocator.swa import (
     SWATokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.common import get_req_to_token_extra_context_len
-from sglang.srt.mem_cache.cp_kv_layer_split import should_use_cp_kv_layer_split_pool
-from sglang.srt.mem_cache.cp_kv_layer_split.deepseek_v4_pool import (
-    CpKvLayerSplitDeepSeekV4TokenToKVPool,
+from sglang.srt.mem_cache.cp_cache_layer_split.deepseek_v4_pool import (
+    CpCacheLayerSplitDeepSeekV4TokenToKVPool,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
@@ -830,18 +830,17 @@ class ModelRunnerKVCacheMixin:
                     self.server_args.max_speculative_num_draft_tokens or 0
                 ),
             )
-            if should_use_cp_kv_layer_split_pool(self.server_args):
-                self.token_to_kv_pool = CpKvLayerSplitDeepSeekV4TokenToKVPool(
-                    cp_rank=get_attention_cp_rank(),
-                    cp_size=get_attention_cp_size(),
-                    model_num_hidden_layers=len(self.model_config.compress_ratios),
-                    cp_kv_layer_split_staging_context_len=(
+            if is_cp_cache_layer_split_enabled(self.server_args):
+                self.token_to_kv_pool = CpCacheLayerSplitDeepSeekV4TokenToKVPool(
+                    cp_rank=get_attn_context_model_parallel_rank(),
+                    cp_size=get_attn_context_model_parallel_world_size(),
+                    cp_cache_layer_split_staging_context_len=(
                         self.model_config.context_len
                     ),
-                    cp_kv_layer_split_staging_chunked_prefill_size=(
+                    cp_cache_layer_split_staging_chunked_prefill_size=(
                         self.server_args.chunked_prefill_size
                     ),
-                    cp_kv_layer_split_staging_max_prefill_tokens=(
+                    cp_cache_layer_split_staging_max_prefill_tokens=(
                         self.server_args.max_prefill_tokens
                     ),
                     **pool_kwargs,
@@ -1369,15 +1368,14 @@ class ModelRunnerKVCacheMixin:
             )
             token_capacity = tensor.item()
 
-        # CP KV layer split broadcasts full per-layer page buffers between
-        # attention-CP ranks. Capacity must therefore be identical within the CP
-        # group so every rank allocates the same page-buffer shape.
-        if should_use_cp_kv_layer_split_pool(self.server_args):
+        # Keep capacity identical across CP ranks so sharded pools and
+        # dynamically grown staging buffers use a consistent capacity bound.
+        if is_cp_cache_layer_split_enabled(self.server_args):
             tensor = torch.tensor(token_capacity, dtype=torch.int64)
             torch.distributed.all_reduce(
                 tensor,
                 op=torch.distributed.ReduceOp.MIN,
-                group=get_attention_cp_group().cpu_group,
+                group=get_attn_cp_group().cpu_group,
             )
             token_capacity = tensor.item()
 

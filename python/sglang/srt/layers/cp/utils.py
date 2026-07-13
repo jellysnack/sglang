@@ -32,6 +32,7 @@ from sglang.srt.layers.cp.zigzag import (
     ZigzagContextParallelMetadata,
     ZigzagCPStrategy,
 )
+from sglang.srt.runtime_context import get_parallel, get_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -41,6 +42,12 @@ CP_V2_DEFAULT_MODEL_CLASSES = frozenset(
         "Qwen3MoeForCausalLM",
     }
 )
+
+
+def is_cp_cache_layer_split_enabled(server_args=None) -> bool:
+    """Whether CP Cache LayerSplit is enabled for this process."""
+    args = server_args if server_args is not None else get_server_args()
+    return bool(args.enable_cp_cache_layer_split)
 
 
 def is_glm_dsa_cache_layer_split_enabled(model_runner: "ModelRunner") -> bool:
@@ -53,7 +60,7 @@ def is_glm_dsa_cache_layer_split_enabled(model_runner: "ModelRunner") -> bool:
 
     return (
         not model_runner.is_draft_worker
-        and model_runner.server_args.enable_dsa_cache_layer_split
+        and is_cp_cache_layer_split_enabled(model_runner.server_args)
         and model_runner.use_mla_backend
         and is_deepseek_dsa(model_runner.model_config.hf_config)
     )
@@ -66,17 +73,13 @@ def get_glm_dsa_cp_layer_shard_info(
 
     ``(None, 1)`` disables sharding (feature off or only one CP rank).
     """
-    from sglang.srt.layers.dp_attention import (
-        get_attention_cp_rank,
-        get_attention_cp_size,
-    )
 
     if not is_glm_dsa_cache_layer_split_enabled(model_runner):
         return None, 1
-    shard_size = get_attention_cp_size()
+    shard_size = get_parallel().attn_cp_size
     if shard_size <= 1:
         return None, 1
-    return get_attention_cp_rank(), shard_size
+    return get_parallel().attn_cp_rank, shard_size
 
 
 def get_glm_dsa_layer_split_effective_num_layers(
@@ -88,11 +91,10 @@ def get_glm_dsa_layer_split_effective_num_layers(
     layers, plus one extra layer for the remote scratch buffer used when reading
     a layer owned by another CP rank.
     """
-    from sglang.srt.layers.dp_attention import get_attention_cp_size
 
     if not is_glm_dsa_cache_layer_split_enabled(model_runner):
         return num_layers
-    shard_size = get_attention_cp_size()
+    shard_size = get_parallel().attn_cp_size
     if shard_size <= 1:
         return num_layers
     owned_layers_upper_bound = (num_layers + shard_size - 1) // shard_size
@@ -226,6 +228,7 @@ __all__ = [
     "cp_gather_after_forward",
     "cp_split_before_forward",
     "prepare_cp_forward",
+    "is_cp_cache_layer_split_enabled",
     "is_glm_dsa_cache_layer_split_enabled",
     "get_glm_dsa_cp_layer_shard_info",
     "get_glm_dsa_layer_split_effective_num_layers",
