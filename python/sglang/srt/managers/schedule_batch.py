@@ -2377,8 +2377,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 for i, r in enumerate(reqs)
             ]
             prefix_lens = [
-                logical_prefix_lens[i] - recompute_lens[i]
-                for i, r in enumerate(reqs)
+                logical_prefix_lens[i] - recompute_lens[i] for i, r in enumerate(reqs)
             ]
             self.swa_recompute_boundaries = logical_prefix_lens
             for i, req in enumerate(reqs):

@@ -6,6 +6,7 @@ import threading
 import time
 from array import array
 from collections import defaultdict
+from dataclasses import dataclass
 from functools import partial
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any, Iterator, NamedTuple, Optional, TypeVar
@@ -136,6 +137,18 @@ class UnifiedTreeNode:
             return []
 
         return node.get_prefix_hash_values(node.parent) + node.hash_value
+
+
+@dataclass(frozen=True)
+class _FullPrefixMatchSegment:
+    node: UnifiedTreeNode
+    length: int
+
+
+@dataclass(frozen=True)
+class _FullPrefixWalkResult:
+    last_node: UnifiedTreeNode
+    segments: tuple[_FullPrefixMatchSegment, ...]
 
 
 class UnifiedLRUList:
@@ -1062,6 +1075,33 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     # ---- Internal Helpers ----
 
+    def _walk_full_prefix(self, key: RadixKey) -> _FullPrefixWalkResult:
+        """Eagerly walk the FULL radix path, including host-backed nodes.
+
+        A partial match splits the child so every returned segment corresponds
+        to a complete tree node. The walk stops when FULL is absent from both
+        device and host storage.
+        """
+        node = self.root_node
+        segments: list[_FullPrefixMatchSegment] = []
+
+        while len(key) > 0:
+            child = node.children.get(key.child_key(self.page_size))
+            if child is None or (child.evicted and not child.backuped):
+                break
+
+            prefix_len = child.key.match(key, page_size=self.page_size)
+            if prefix_len < len(child.key):
+                node = self._split_node(child.key, child, prefix_len)
+                segments.append(_FullPrefixMatchSegment(node, prefix_len))
+                break
+
+            node = child
+            segments.append(_FullPrefixMatchSegment(node, len(node.key)))
+            key = key[prefix_len:]
+
+        return _FullPrefixWalkResult(node, tuple(segments))
+
     def _match_prefix_helper(
         self, key: RadixKey
     ) -> tuple[list[torch.Tensor], UnifiedTreeNode, UnifiedTreeNode, int]:
@@ -1069,11 +1109,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # device anchor follows the best match. In HiCache mode, host-backed
         # nodes can also match, so we separately track the best device-resident
         # match for scheduler prefix indices and locking.
-        node = self.root_node
-        child_key = key.child_key(self.page_size)
         value: list[torch.Tensor] = []
-        best_match_node = node
-        best_match_device_node = node
+        best_match_node = self.root_node
+        best_match_device_node = self.root_node
         best_match_device_value_len = 0
         separate_device_match = self.cache_controller is not None
         if separate_device_match:
@@ -1109,28 +1147,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 best_match_device_value_len = len(value)
                 best_match_device_node = node
 
-        while len(key) > 0 and child_key in node.children:
-            child = node.children[child_key]
-
-            # HiCache: dead node (evicted + not backuped) — stop traversal
-            if child.evicted and not child.backuped:
-                break
-
-            prefix_len = child.key.match(key, page_size=self.page_size)
-            if prefix_len < len(child.key):
-                node = self._split_node(child.key, child, prefix_len)
-                if not node.evicted:
-                    value.append(node.component_data[BASE_COMPONENT_TYPE].value)
-                _update_best_if_valid(node)
-                break
-
-            if not child.evicted:
-                value.append(child.component_data[BASE_COMPONENT_TYPE].value)
-            node = child
+        walk_result = self._walk_full_prefix(key)
+        for segment in walk_result.segments:
+            node = segment.node
+            if not node.evicted:
+                value.append(node.component_data[BASE_COMPONENT_TYPE].value)
             _update_best_if_valid(node)
-            key = key[prefix_len:]
-            if len(key):
-                child_key = key.child_key(self.page_size)
 
         return (
             value,
@@ -1144,39 +1166,20 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     ) -> tuple[list[torch.Tensor], UnifiedTreeNode, UnifiedTreeNode, int, int]:
         """Match through SWA tombstones and compute trailing recompute length."""
         swa_comp = self.components[ComponentType.SWA]
-        node = self.root_node
-        child_key = key.child_key(self.page_size)
         value: list[torch.Tensor] = []
         last_device_node = self.root_node
         last_device_value_len = 0
         # (token-length, is_recompute_tombstone) per matched segment.
         segments: list[tuple[int, bool]] = []
 
-        while len(key) > 0 and child_key in node.children:
-            child = node.children[child_key]
-            # FULL gone on both device and host → stop the walk.
-            if child.evicted and not child.backuped:
-                break
-
-            prefix_len = child.key.match(key, page_size=self.page_size)
-            if prefix_len < len(child.key):
-                node = self._split_node(child.key, child, prefix_len)
-                if not node.evicted:
-                    value.append(node.component_data[BASE_COMPONENT_TYPE].value)
-                    last_device_node = node
-                    last_device_value_len = len(value)
-                segments.append((prefix_len, swa_comp.is_swa_recompute_tombstone(node)))
-                break
-
-            if not child.evicted:
-                value.append(child.component_data[BASE_COMPONENT_TYPE].value)
-                last_device_node = child
+        walk_result = self._walk_full_prefix(key)
+        for segment in walk_result.segments:
+            node = segment.node
+            if not node.evicted:
+                value.append(node.component_data[BASE_COMPONENT_TYPE].value)
+                last_device_node = node
                 last_device_value_len = len(value)
-            node = child
-            segments.append((len(child.key), swa_comp.is_swa_recompute_tombstone(node)))
-            key = key[prefix_len:]
-            if len(key):
-                child_key = key.child_key(self.page_size)
+            segments.append((segment.length, swa_comp.is_swa_recompute_tombstone(node)))
 
         total_len = sum(seg_len for seg_len, _ in segments)
         # A cache hit is valid as long as the current SWA tail is live. If the
@@ -1209,10 +1212,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
 
         if gated:
-            return value, node, last_device_node, last_device_value_len, -1
+            return (
+                value,
+                walk_result.last_node,
+                last_device_node,
+                last_device_value_len,
+                -1,
+            )
         return (
             value,
-            node,
+            walk_result.last_node,
             last_device_node,
             last_device_value_len,
             swa_recompute_len,
@@ -2794,15 +2803,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             and swa._swa_kv_pool_host is None
         )
         return swa.sliding_window_size if unified_compress_only_hicache else 0
-
-    def _swa_recompute_window_size(self) -> int:
-        """Proxy to ``SWAComponent.swa_recompute_window_size`` for the
-        scheduler's startup chunk-size compatibility check."""
-        swa = self.components.get(ComponentType.SWA)
-        assert (
-            swa is not None
-        ), "_swa_recompute_window_size called without an SWA component"
-        return swa.swa_recompute_window_size()
 
     def supports_swa(self) -> bool:
         return ComponentType.SWA in self.components

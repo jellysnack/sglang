@@ -603,6 +603,7 @@ class TestPrefillAdder(CustomTestCase):
         req.last_node = MagicMock(name=f"{rid}_last_node")
         req.last_host_node = MagicMock(name=f"{rid}_last_host_node")
         req.best_match_node = MagicMock(name=f"{rid}_best_match_node")
+
         def reset_swa_recompute_to_cold_prefill(root_node):
             req.prefix_indices = req.prefix_indices[:0]
             req.last_node = root_node

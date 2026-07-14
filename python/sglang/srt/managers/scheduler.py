@@ -224,7 +224,6 @@ from sglang.srt.managers.utils import (
 )
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -453,6 +452,7 @@ class Scheduler(
         self.is_hybrid_swa = result.is_hybrid_swa
         self.is_hybrid_ssm = result.is_hybrid_ssm
         self.sliding_window_size = result.sliding_window_size
+        self.swa_recompute_config = result.swa_recompute_config
         self.full_tokens_per_layer = result.full_tokens_per_layer
         self.swa_tokens_per_layer = result.swa_tokens_per_layer
         self.req_to_token_pool = result.req_to_token_pool
@@ -1038,14 +1038,10 @@ class Scheduler(
                 "SGLANG_OPT_SWA_RECOMPUTE_WINDOW=1 is not supported on the "
                 "DeepSeek V4 HIP radix attention backend yet."
             )
-        if not isinstance(self.tree_cache, UnifiedRadixCache):
-            raise ValueError(
-                "SGLANG_OPT_SWA_RECOMPUTE_WINDOW=1 currently requires "
-                f"UnifiedRadixCache. Got {type(self.tree_cache).__name__}."
-            )
+        assert self.swa_recompute_config is not None
         if self.chunked_prefill_size is None:
             return
-        w_r = self.tree_cache._swa_recompute_window_size()
+        w_r = self.swa_recompute_config.window_size
         required = w_r + self.page_size
         if self.chunked_prefill_size < required:
             raise ValueError(
@@ -1065,7 +1061,7 @@ class Scheduler(
             not envs.SGLANG_DEBUG_SWA_RECOMPUTE_CP_ADMISSION.get()
             or not envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.get()
             or self.ps.attn_cp_size <= 1
-            or not isinstance(self.tree_cache, UnifiedRadixCache)
+            or self.swa_recompute_config is None
         ):
             return
 
@@ -3072,7 +3068,7 @@ class Scheduler(
         swa_recompute_lens: Optional[List[int]] = None
         if (
             envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.get()
-            and isinstance(self.tree_cache, UnifiedRadixCache)
+            and self.swa_recompute_config is not None
             and any(req.swa_recompute_len > 0 for req in can_run_list)
         ):
             swa_recompute_lens = [max(0, req.swa_recompute_len) for req in can_run_list]

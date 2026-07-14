@@ -361,9 +361,8 @@ __global__ void plan_compress_prefill_kernel_1(const Prefill1Params params) {
       plan_w.write_loc = compute_c128_loc(rid, position);
     } else {
       const auto raw_loc = mapping[position];
-      const auto swa_loc = has_swa_override
-                               ? params.swa_override_ptr[ragged_id]
-                               : static_cast<int32_t>(params.f2s_ptr[raw_loc]);
+      const auto swa_loc =
+          has_swa_override ? params.swa_override_ptr[ragged_id] : static_cast<int32_t>(params.f2s_ptr[raw_loc]);
       plan_w.write_loc = compute_loc(swa_loc);
     }
     params.plan_w[idx] = plan_w;

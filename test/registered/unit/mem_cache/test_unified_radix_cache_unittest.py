@@ -32,7 +32,10 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.cache_init_params import (
+    CacheInitParams,
+    SWARecomputeConfig,
+)
 from sglang.srt.mem_cache.common import available_and_evictable_str
 from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName
 from sglang.srt.mem_cache.memory_pool import (
@@ -322,13 +325,22 @@ def build_fixture(cfg: CacheConfig, *, enable_kv_cache_events: bool = False):
             need_sort=False,
         )
 
+    swa_recompute_config = None
+    if cfg.swa_num_layers is not None:
+        swa_recompute_config = SWARecomputeConfig.from_dimensions(
+            sliding_window_size=cfg.sliding_window_size,
+            num_swa_layers=cfg.swa_num_layers,
+            page_size=cfg.page_size,
+            gate_multiplier=envs.SGLANG_SWA_RECOMPUTE_GATE_MULTIPLIER.get(),
+        )
+
     cache_init_params = CacheInitParams(
         req_to_token_pool=req_to_token_pool,
         token_to_kv_pool_allocator=allocator,
         page_size=cfg.page_size,
         disable=False,
         sliding_window_size=cfg.sliding_window_size,
-        swa_num_layers=cfg.swa_num_layers,
+        swa_recompute_config=swa_recompute_config,
         tree_components=cfg.components,
         enable_mamba_extra_buffer=cfg.enable_mamba_extra_buffer,
         enable_kv_cache_events=enable_kv_cache_events,
@@ -642,15 +654,36 @@ class TestUnifiedSWARecomputeWindowSizing(CustomTestCase):
             page_size=256,
             components=(ComponentType.FULL, ComponentType.SWA),
             sliding_window_size=128,
+            swa_num_layers=42,
             kv_size=8192,
             max_context_len=8192,
         )
         tree, _, _ = build_fixture(cfg)
         swa = tree.components[ComponentType.SWA]
-        swa.swa_num_layers = 42
 
-        self.assertEqual(tree._swa_recompute_window_size(), 5632)
+        self.assertEqual(swa.recompute_config.window_size, 5632)
         self.assertEqual(swa.swa_recompute_gate_threshold(), 11264)
+
+    def test_gate_multiplier_is_page_aligned(self):
+        with envs.SGLANG_SWA_RECOMPUTE_GATE_MULTIPLIER.override(1.5):
+            config = SWARecomputeConfig.from_dimensions(
+                sliding_window_size=128,
+                num_swa_layers=42,
+                page_size=256,
+                gate_multiplier=envs.SGLANG_SWA_RECOMPUTE_GATE_MULTIPLIER.get(),
+            )
+
+        self.assertEqual(config.window_size, 5632)
+        self.assertEqual(config.gate_threshold, 8448)
+
+    def test_gate_multiplier_must_be_at_least_one(self):
+        with self.assertRaisesRegex(ValueError, "at least 1"):
+            SWARecomputeConfig.from_dimensions(
+                sliding_window_size=128,
+                num_swa_layers=42,
+                page_size=256,
+                gate_multiplier=0.5,
+            )
 
 
 class UnifiedRadixCacheSuite:
@@ -2232,9 +2265,14 @@ class UnifiedRadixCacheSuite:
     # ================================================================
 
     def _enable_swa_recompute(self, tree):
-        """Set the SWA layer count used by recompute window sizing."""
+        """Configure recompute sizing for SWA test fixtures."""
         swa = tree.components[ComponentType.SWA]
-        swa.swa_num_layers = 1
+        swa.recompute_config = SWARecomputeConfig.from_dimensions(
+            sliding_window_size=swa.sliding_window_size,
+            num_swa_layers=1,
+            page_size=tree.page_size,
+            gate_multiplier=envs.SGLANG_SWA_RECOMPUTE_GATE_MULTIPLIER.get(),
+        )
         return swa
 
     def test_swa_recompute_zero_when_all_live(self):

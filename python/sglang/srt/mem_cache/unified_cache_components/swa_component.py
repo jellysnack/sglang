@@ -58,10 +58,7 @@ class SWAComponent(TreeComponent):
         ), f"SWAComponent requires SWATokenToKVPoolAllocator, got {type(cache.token_to_kv_pool_allocator)}"
         super().__init__(cache, params)
         self.sliding_window_size = params.sliding_window_size
-        # Used to size the SWA-window recompute window W_r. Only required when
-        # SGLANG_OPT_SWA_RECOMPUTE_WINDOW is enabled; the cache builder enforces
-        # it there.
-        self.swa_num_layers = params.swa_num_layers
+        self.recompute_config = params.swa_recompute_config
         # HiCache state: set to host SWA pool when HiCache enabled
         self._swa_kv_pool_host = None
 
@@ -143,16 +140,16 @@ class SWAComponent(TreeComponent):
     def swa_recompute_window_size(self) -> int:
         """Page-aligned trailing recompute window."""
         assert (
-            self.swa_num_layers and self.swa_num_layers > 0
-        ), "swa_num_layers must be set for SWA-window recompute"
-        page = self.cache.page_size
-        commit_tail = (self.sliding_window_size + page - 1) // page * page
-        n = commit_tail + (self.swa_num_layers - 1) * self.sliding_window_size
-        return (n + page - 1) // page * page
+            self.recompute_config is not None
+        ), "swa_recompute_config must be set for SWA-window recompute"
+        return self.recompute_config.window_size
 
     def swa_recompute_gate_threshold(self) -> int:
         """Min matched-prefix length to take the recompute path."""
-        return 2 * self.swa_recompute_window_size()
+        assert (
+            self.recompute_config is not None
+        ), "swa_recompute_config must be set for SWA-window recompute"
+        return self.recompute_config.gate_threshold
 
     def _swa_storage_recompute_gate_threshold(self) -> Optional[int]:
         if not envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.get():
