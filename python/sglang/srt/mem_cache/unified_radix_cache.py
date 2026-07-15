@@ -53,7 +53,6 @@ from sglang.srt.mem_cache.unified_cache_components import (
     SWAComponent,
     TreeComponent,
     get_and_increase_time_counter,
-    next_component_uuid,
 )
 from sglang.srt.mem_cache.utils import (
     compute_node_hash_values,
@@ -604,13 +603,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.get()
             and ComponentType.SWA in self.components
         ):
+            walk_result = self._walk_full_prefix(key)
             (
                 value,
                 best_match_node,
                 best_match_device_node,
                 best_match_device_value_len,
                 swa_recompute_len,
-            ) = self._match_prefix_helper_recompute(key)
+            ) = self._match_prefix_helper_recompute(walk_result)
             if swa_recompute_len >= 0:
                 return self._match_post_processor(
                     params,
@@ -621,12 +621,20 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     swa_recompute_len=swa_recompute_len,
                 )
 
-        (
-            value,
-            best_match_node,
-            best_match_device_node,
-            best_match_device_value_len,
-        ) = self._match_prefix_helper(key)
+            (
+                value,
+                best_match_node,
+                best_match_device_node,
+                best_match_device_value_len,
+            ) = self._match_prefix_from_walk(walk_result)
+        else:
+            (
+                value,
+                best_match_node,
+                best_match_device_node,
+                best_match_device_value_len,
+            ) = self._match_prefix_helper(key)
+
         return self._match_post_processor(
             params,
             value,
@@ -755,40 +763,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._update_evictable_leaf_sets(node)
         return result
 
-    def _acquire_swa_refs_for_existing_full_lock(
-        self, node: Any, lock_len: int
-    ) -> Optional[int]:
-        ct = ComponentType.SWA
-        swa_lock_size = 0
-        swa_uuid_for_lock = None
-        cur = node
-        while cur != self.root_node and swa_lock_size < lock_len:
-            comp = cur.component_data[ct]
-            assert (
-                cur.component_data[BASE_COMPONENT_TYPE].lock_ref > 0
-            ), f"complete_swa_recompute_lock on node without full lock, {cur.id=}"
-            assert (
-                comp.value is not None
-            ), f"complete_swa_recompute_lock on missing SWA value, {cur.id=}"
-            if comp.lock_ref == 0:
-                key_len = len(comp.value)
-                self.component_evictable_size_[ct] -= key_len
-                self.component_protected_size_[ct] += key_len
-            comp.lock_ref += 1
-            swa_lock_size += len(comp.value)
-            if swa_lock_size >= lock_len:
-                if comp.metadata.get("uuid") is None:
-                    comp.metadata["uuid"] = next_component_uuid()
-                swa_uuid_for_lock = comp.metadata["uuid"]
-            cur = cur.parent
-
-        assert swa_lock_size >= lock_len, (
-            "complete_swa_recompute_lock did not cover the requested SWA tail, "
-            f"{swa_lock_size=}, {lock_len=}"
-        )
-        self._update_evictable_leaf_sets(node)
-        return swa_uuid_for_lock
-
     def complete_swa_recompute_lock(self, req: Req, recompute_len: int) -> None:
         """Upgrade this request lock to cover the valid recomputed SWA tail."""
         if self.disable or recompute_len <= 0:
@@ -800,7 +774,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             f"rid={req.rid}"
         )
         self.revive_swa_tombstone_window(req.last_node, recompute_len)
-        req.swa_uuid_for_lock = self._acquire_swa_refs_for_existing_full_lock(
+        req.swa_uuid_for_lock = swa.acquire_recomputed_window_lock(
             req.last_node, recompute_len
         )
         req.swa_prefix_lock_released = False
@@ -816,7 +790,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return result
         if self.disable:
             return DecLockRefResult()
-        skip_swa = params is not None and params.swa_skipped
+        skip_swa = skip_swa or (params is not None and params.swa_skipped)
         for component in self._components_tuple:
             if skip_swa and component.component_type == ComponentType.SWA:
                 continue
@@ -1105,6 +1079,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def _match_prefix_helper(
         self, key: RadixKey
     ) -> tuple[list[torch.Tensor], UnifiedTreeNode, UnifiedTreeNode, int]:
+        return self._match_prefix_from_walk(self._walk_full_prefix(key))
+
+    def _match_prefix_from_walk(
+        self, walk_result: _FullPrefixWalkResult
+    ) -> tuple[list[torch.Tensor], UnifiedTreeNode, UnifiedTreeNode, int]:
         # Non-HiCache mode has only device-resident matches, so the scheduler
         # device anchor follows the best match. In HiCache mode, host-backed
         # nodes can also match, so we separately track the best device-resident
@@ -1147,7 +1126,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 best_match_device_value_len = len(value)
                 best_match_device_node = node
 
-        walk_result = self._walk_full_prefix(key)
         for segment in walk_result.segments:
             node = segment.node
             if not node.evicted:
@@ -1162,7 +1140,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
 
     def _match_prefix_helper_recompute(
-        self, key: RadixKey
+        self, walk_result: _FullPrefixWalkResult
     ) -> tuple[list[torch.Tensor], UnifiedTreeNode, UnifiedTreeNode, int, int]:
         """Match through SWA tombstones and compute trailing recompute length."""
         swa_comp = self.components[ComponentType.SWA]
@@ -1172,7 +1150,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # (token-length, is_recompute_tombstone) per matched segment.
         segments: list[tuple[int, bool]] = []
 
-        walk_result = self._walk_full_prefix(key)
         for segment in walk_result.segments:
             node = segment.node
             if not node.evicted:

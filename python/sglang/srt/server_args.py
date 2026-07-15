@@ -99,6 +99,7 @@ logger = logging.getLogger(__name__)
 
 # Define constants
 DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
+_SWA_RECOMPUTE_SUPPORTED_STORAGE_BACKENDS = frozenset({None, "mooncake"})
 
 SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
 if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
@@ -6185,6 +6186,71 @@ class ServerArgs:
                 )
             envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
 
+    def _validate_swa_recompute_compatibility(self):
+        """Reject server configurations unsupported by SWA recompute."""
+        if (
+            envs.SGLANG_DEBUG_FORCE_SWA_RECOMPUTE.get()
+            and not envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.get()
+        ):
+            raise ValueError(
+                "SGLANG_DEBUG_FORCE_SWA_RECOMPUTE requires "
+                "SGLANG_OPT_SWA_RECOMPUTE_WINDOW=1."
+            )
+        if not envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.get():
+            return
+
+        config = self._resolved()
+        model_config = self.get_model_config()
+        if not model_config.is_hybrid_swa:
+            raise ValueError(
+                "SGLANG_OPT_SWA_RECOMPUTE_WINDOW=1 requires a hybrid SWA model."
+            )
+        if not getattr(model_config, "is_deepseek_v4_arch", False):
+            raise ValueError(
+                "SGLANG_OPT_SWA_RECOMPUTE_WINDOW is only supported on the "
+                "DeepSeek V4 architecture. Got "
+                f"architectures={model_config.hf_config.architectures}."
+            )
+        if config.speculative_algorithm is not None:
+            raise ValueError(
+                "SGLANG_OPT_SWA_RECOMPUTE_WINDOW is not supported with "
+                f"speculative decoding ({config.speculative_algorithm})."
+            )
+        if not envs.SGLANG_OPT_USE_COMPRESSOR_V2.get():
+            raise ValueError(
+                "SGLANG_OPT_SWA_RECOMPUTE_WINDOW requires "
+                "SGLANG_OPT_USE_COMPRESSOR_V2=1."
+            )
+        if envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
+            raise ValueError(
+                "SGLANG_OPT_SWA_RECOMPUTE_WINDOW is not supported with "
+                "SGLANG_OPT_USE_ONLINE_COMPRESS=1."
+            )
+        if config.dcp_size > 1:
+            raise ValueError(
+                "SGLANG_OPT_SWA_RECOMPUTE_WINDOW is not supported with "
+                f"decode context parallelism (dcp_size={config.dcp_size})."
+            )
+        if (
+            config.hicache_storage_backend
+            not in _SWA_RECOMPUTE_SUPPORTED_STORAGE_BACKENDS
+        ):
+            raise ValueError(
+                "SGLANG_OPT_SWA_RECOMPUTE_WINDOW with HiCache L3 storage "
+                "currently supports only --hicache-storage-backend=mooncake. "
+                f"Got {config.hicache_storage_backend!r}."
+            )
+
+        from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_triton,
+        )
+
+        if is_unified_kv_triton():
+            raise ValueError(
+                "SGLANG_OPT_SWA_RECOMPUTE_WINDOW is not supported with "
+                "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton."
+            )
+
     def _handle_cache_compatibility(self):
         if self.enable_session_radix_cache and self.radix_eviction_policy != "priority":
             raise ValueError(
@@ -6212,6 +6278,8 @@ class ServerArgs:
         # the user input before it ever takes effect.
         if not (0 < self._resolved().swa_full_tokens_ratio <= 1.0):
             raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
+
+        self._validate_swa_recompute_compatibility()
 
     def _handle_deterministic_inference(self):
         if self.rl_on_policy_target is not None:

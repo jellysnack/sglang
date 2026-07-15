@@ -2057,6 +2057,10 @@ class DeepseekV4AttnBackend(
         extend_start_loc: torch.Tensor,
         swa_out_cache_loc_override: torch.Tensor,
     ) -> torch.Tensor:
+        """Read synthetic extend ``[P - R, end)`` from private COW SWA slots.
+
+        Older prefix positions keep using the global FULL-to-SWA mapping.
+        """
         pos_causal = seq_lens_casual - 1
         num_qo_tokens = seq_lens_casual.size(0)
         offsets = pos_causal.unsqueeze(1) - torch.arange(

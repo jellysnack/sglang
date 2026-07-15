@@ -1054,49 +1054,6 @@ class Scheduler(
                 "SWA-window recompute feature."
             )
 
-    def _debug_assert_swa_recompute_admission_consistent_across_cp(
-        self, can_run_list: List[Req]
-    ) -> None:
-        if (
-            not envs.SGLANG_DEBUG_SWA_RECOMPUTE_CP_ADMISSION.get()
-            or not envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.get()
-            or self.ps.attn_cp_size <= 1
-            or self.swa_recompute_config is None
-        ):
-            return
-
-        local_summary = [
-            (
-                req.rid,
-                len(req.prefix_indices),
-                int(req.extend_range.length),
-                int(req.extend_range.end),
-                int(req.swa_recompute_len),
-                int(req.host_hit_length),
-                int(req.swa_host_hit_length),
-                int(req.mamba_host_hit_length),
-                int(getattr(req, "storage_hit_length", 0)),
-                int(getattr(req, "cache_protected_len", 0)),
-                getattr(req.last_node, "id", None),
-                getattr(req.best_match_node, "id", None),
-                getattr(req.last_host_node, "id", None),
-            )
-            for req in can_run_list
-        ]
-        gathered: List[List[Tuple[Any, ...]]] = [
-            [] for _ in range(self.ps.attn_cp_size)
-        ]
-        torch.distributed.all_gather_object(
-            gathered, local_summary, group=self.attn_cp_cpu_group
-        )
-        reference = gathered[0]
-        for rank, summary in enumerate(gathered[1:], start=1):
-            if summary != reference:
-                raise AssertionError(
-                    "SWA-window recompute CP admission diverged: "
-                    f"rank0={reference}, rank{rank}={summary}"
-                )
-
     def init_schedule_policy(self):
         # Init schedule policy and new token estimation
         self.policy = SchedulePolicy(
@@ -3045,7 +3002,6 @@ class Scheduler(
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
-        self._debug_assert_swa_recompute_admission_consistent_across_cp(can_run_list)
         if len(can_run_list) == 0:
             return None, running_batch
 

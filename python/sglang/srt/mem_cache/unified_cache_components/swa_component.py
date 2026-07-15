@@ -596,22 +596,59 @@ class SWAComponent(TreeComponent):
         result: IncLockRefResult,
         lock_host: bool = False,
     ) -> IncLockRefResult:
+        return self._acquire_window_lock(
+            node,
+            result,
+            lock_size=self.sliding_window_size,
+            lock_host=lock_host,
+        )
+
+    def acquire_recomputed_window_lock(
+        self, node: UnifiedTreeNode, lock_size: int
+    ) -> Optional[int]:
+        """Acquire SWA refs after recompute materializes a FULL-locked window."""
+        result = self._acquire_window_lock(
+            node,
+            IncLockRefResult(),
+            lock_size=lock_size,
+            lock_host=False,
+            require_recompute_ready=True,
+        )
+        self.cache._update_evictable_leaf_sets(node)
+        return result.swa_uuid_for_lock
+
+    def _acquire_window_lock(
+        self,
+        node: UnifiedTreeNode,
+        result: IncLockRefResult,
+        *,
+        lock_size: int,
+        lock_host: bool,
+        require_recompute_ready: bool = False,
+    ) -> IncLockRefResult:
         ct = self.component_type
         root = self.cache.root_node
-        sliding_window_size = self.sliding_window_size
         swa_lock_size = 0
         swa_uuid = None
         uuid_key = "host_uuid" if lock_host else "uuid"
         lru = self.cache.host_lru_lists[ct] if lock_host else self.cache.lru_lists[ct]
 
-        # Tombstoned ancestors (cd.value is None) have no SWA chunk to protect;
-        # walk past them. Hit when HiCache backs up a FULL-alive internal node
-        # whose SWA was already evicted.
         cur = node
-        while cur != root and swa_lock_size < sliding_window_size:
+        while cur != root and swa_lock_size < lock_size:
             comp = cur.component_data[ct]
+            if require_recompute_ready:
+                assert cur.component_data[BASE_COMPONENT_TYPE].lock_ref > 0, (
+                    "acquire_recomputed_window_lock found a node without a FULL "
+                    f"lock, node={cur.id}"
+                )
             value = comp.host_value if lock_host else comp.value
             if value is None:
+                assert not require_recompute_ready, (
+                    "acquire_recomputed_window_lock found a missing SWA value, "
+                    f"node={cur.id}"
+                )
+                # Tombstoned ancestors have no SWA chunk to protect; walk past
+                # them and make the matching release skip them as well.
                 result.skip_lock_node_ids.setdefault(ct, set()).add(cur.id)
                 cur = cur.parent
                 continue
@@ -622,20 +659,25 @@ class SWAComponent(TreeComponent):
                     if lru.in_list(cur):
                         lru.remove_node(cur)
                 else:
-                    key_len = len(cur.key)
-                    self.cache.component_evictable_size_[ct] -= key_len
-                    self.cache.component_protected_size_[ct] += key_len
+                    value_len = len(value)
+                    self.cache.component_evictable_size_[ct] -= value_len
+                    self.cache.component_protected_size_[ct] += value_len
             if lock_host:
                 comp.host_lock_ref = ref + 1
             else:
                 comp.lock_ref = ref + 1
             swa_lock_size += len(value)
-            if swa_lock_size >= sliding_window_size:
+            if swa_lock_size >= lock_size:
                 if comp.metadata.get(uuid_key) is None:
                     comp.metadata[uuid_key] = next_component_uuid()
                 swa_uuid = comp.metadata[uuid_key]
             cur = cur.parent
 
+        if require_recompute_ready:
+            assert swa_lock_size >= lock_size, (
+                "acquire_recomputed_window_lock did not cover the requested SWA "
+                f"tail, covered={swa_lock_size}, requested={lock_size}"
+            )
         if lock_host:
             result.swa_uuid_for_host_lock = swa_uuid
         else:

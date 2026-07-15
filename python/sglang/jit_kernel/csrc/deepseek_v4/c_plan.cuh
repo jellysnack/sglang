@@ -542,6 +542,10 @@ inline PrefillPlan plan_compress_prefill(
       .verify(seq_lens)
       .verify(extend_lens);
   TensorMatcher({-1})  //
+      .with_dtype<IDX_T>()
+      .with_device(cpu_or_gpu)
+      .verify(recompute_boundary);
+  TensorMatcher({-1})  //
       .with_dtype<SWA_LOC_T>()
       .with_device(device_)
       .verify(swa_override);
@@ -573,6 +577,9 @@ inline PrefillPlan plan_compress_prefill(
   constexpr auto kMaxTokens = static_cast<uint32_t>(std::numeric_limits<uint16_t>::max());
   RuntimeCheck(compress_ratio == 4 || compress_ratio == 128);
   RuntimeCheck(batch_size <= num_q_tokens && num_q_tokens <= kMaxTokens);
+  RuntimeCheck(
+      rb_ptr == nullptr || static_cast<uint32_t>(recompute_boundary.numel()) == batch_size,
+      "recompute_boundary must be empty or contain one value per request");
   RuntimeCheck((swa_override_ptr == nullptr) == (extend_start_loc_ptr == nullptr));
   RuntimeCheck(swa_override_ptr == nullptr || static_cast<uint32_t>(swa_override.numel()) >= num_q_tokens);
   RuntimeCheck(extend_start_loc_ptr == nullptr || static_cast<uint32_t>(extend_start_loc.numel()) == batch_size);

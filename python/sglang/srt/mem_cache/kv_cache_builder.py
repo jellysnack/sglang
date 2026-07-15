@@ -183,50 +183,6 @@ def build_kv_cache(
             page_size=page_size,
             gate_multiplier=envs.SGLANG_SWA_RECOMPUTE_GATE_MULTIPLIER.get(),
         )
-        if (
-            envs.SGLANG_DEBUG_FORCE_SWA_RECOMPUTE.get()
-            and not envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.get()
-        ):
-            raise ValueError(
-                "SGLANG_DEBUG_FORCE_SWA_RECOMPUTE requires "
-                "SGLANG_OPT_SWA_RECOMPUTE_WINDOW=1."
-            )
-        if envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.get():
-            if not getattr(model_config, "is_deepseek_v4_arch", False):
-                raise ValueError(
-                    "SGLANG_OPT_SWA_RECOMPUTE_WINDOW is only supported on the "
-                    "DeepSeek V4 architecture. Got "
-                    f"architectures={model_config.hf_config.architectures}."
-                )
-            if not spec_algorithm.is_none():
-                raise ValueError(
-                    "SGLANG_OPT_SWA_RECOMPUTE_WINDOW is not supported with "
-                    f"speculative decoding ({spec_algorithm})."
-                )
-            if not envs.SGLANG_OPT_USE_COMPRESSOR_V2.get():
-                raise ValueError(
-                    "SGLANG_OPT_SWA_RECOMPUTE_WINDOW requires "
-                    "SGLANG_OPT_USE_COMPRESSOR_V2=1."
-                )
-            if envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
-                raise ValueError(
-                    "SGLANG_OPT_SWA_RECOMPUTE_WINDOW is not supported with "
-                    "SGLANG_OPT_USE_ONLINE_COMPRESS=1."
-                )
-            if server_args.pp_size > 1:
-                raise ValueError(
-                    "SGLANG_OPT_SWA_RECOMPUTE_WINDOW is not supported with "
-                    f"pipeline parallelism (pp_size={server_args.pp_size})."
-                )
-            from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
-                is_unified_kv_triton,
-            )
-
-            if is_unified_kv_triton():
-                raise ValueError(
-                    "SGLANG_OPT_SWA_RECOMPUTE_WINDOW is not supported with "
-                    "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton."
-                )
 
     req_to_token_pool, token_to_kv_pool_allocator = tp_worker.get_memory_pool()
 

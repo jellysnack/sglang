@@ -1599,6 +1599,38 @@ class UnifiedRadixCacheSuite:
         self.assertTrue(cache._is_device_leaf(node_a))
         cache.sanity_check()
 
+    def test_dec_lock_ref_honors_explicit_skip_swa(self):
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            self.skipTest("requires SWA without Mamba")
+
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        window_pages = (
+            self.cfg.sliding_window_size + self.cfg.page_size - 1
+        ) // self.cfg.page_size
+        seq = self._make_seq(1, window_pages + 1)
+        self._insert(cache, allocator, req_to_token_pool, seq)
+        node = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", seq)))
+        ).last_device_node
+
+        lock_result = cache.inc_lock_ref(node)
+        swa_data = node.component_data[ComponentType.SWA]
+        full_data = node.component_data[ComponentType.FULL]
+        swa_lock_ref = swa_data.lock_ref
+        full_lock_ref = full_data.lock_ref
+        self.assertGreater(swa_lock_ref, 0)
+        self.assertGreater(full_lock_ref, 0)
+
+        cache.dec_lock_ref(node, lock_result.to_dec_params(), skip_swa=True)
+
+        self.assertEqual(swa_data.lock_ref, swa_lock_ref)
+        self.assertLess(full_data.lock_ref, full_lock_ref)
+
+        full_only_lock = cache.inc_lock_ref_for_swa_recompute(node)
+        cache.dec_swa_lock_only(node, lock_result.swa_uuid_for_lock)
+        cache.dec_lock_ref(node, full_only_lock.to_dec_params())
+        cache.sanity_check()
+
     def test_swa_leaf_capped_to_window_on_insert(self):
         """A long SWA leaf is split so locking it protects one window of SWA
         while full attention still protects the whole sequence."""
@@ -2372,9 +2404,12 @@ class UnifiedRadixCacheSuite:
         cd_swa.value = None
         cd_swa.host_value = None
 
-        with envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.override(True):
+        with mock.patch.object(
+            tree, "_walk_full_prefix", wraps=tree._walk_full_prefix
+        ) as walk_full_prefix, envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.override(True):
             result = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
 
+        self.assertEqual(walk_full_prefix.call_count, 1)
         self.assertEqual(result.swa_recompute_len, 0)
         self.assertEqual(result.host_hit_length, 0)
         self.assertEqual(len(result.device_indices), 0)
@@ -2456,6 +2491,45 @@ class UnifiedRadixCacheSuite:
             )
         )
         self.assertFalse(tree.host_lru_lists[ComponentType.SWA].in_list(leaf))
+
+    def test_swa_recompute_completes_full_only_lock(self):
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            self.skipTest("requires SWA without Mamba")
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._enable_swa_recompute(tree)
+        seq = self._make_seq(1, 2)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+
+        match = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        leaf = match.last_device_node
+        full_data = leaf.component_data[ComponentType.FULL]
+        swa_data = leaf.component_data[ComponentType.SWA]
+        recompute_len = len(swa_data.value)
+        tree._evict_component_and_detach_lru(
+            leaf,
+            tree.components[ComponentType.SWA],
+            target=EvictLayer.DEVICE,
+        )
+        fresh_swa = allocator.alloc_fresh_swa_for_recompute_window(full_data.value)
+        self.assertIsNotNone(fresh_swa)
+        allocator.commit_fresh_swa_for_recompute_window(full_data.value, fresh_swa)
+
+        lock_result = tree.inc_lock_ref_for_swa_recompute(leaf)
+        req = self._make_req(req_to_token_pool)
+        req.last_node = leaf
+        req.swa_prefix_lock_released = lock_result.swa_skipped
+        tree.complete_swa_recompute_lock(req, recompute_len)
+
+        self.assertGreater(full_data.lock_ref, 0)
+        self.assertGreater(swa_data.lock_ref, 0)
+        self.assertFalse(req.swa_prefix_lock_released)
+        self.assertIsNotNone(req.swa_uuid_for_lock)
+
+        tree.dec_lock_ref(
+            leaf,
+            DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock),
+        )
+        tree.sanity_check()
 
     # ================================================================
     # HiCache Unit Tests (real cache_controller D<->H backup/load)

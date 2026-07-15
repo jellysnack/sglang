@@ -87,5 +87,44 @@ def test_boundary_suppresses_window_compress_but_keeps_writes(
     assert gated_w == base_w
 
 
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        pytest.param(torch.tensor([PAGE], dtype=torch.int64), id="wrong-length"),
+        pytest.param(torch.tensor([PAGE, PAGE], dtype=torch.int32), id="wrong-dtype"),
+        pytest.param(
+            torch.tensor([[PAGE], [PAGE]], dtype=torch.int64), id="wrong-rank"
+        ),
+    ],
+)
+def test_boundary_metadata_is_validated(boundary: torch.Tensor) -> None:
+    seq_extend = [(2 * PAGE, PAGE), (3 * PAGE, PAGE)]
+    ctx = make_paged_context(bs=len(seq_extend), compress_ratio=4, head_dim=HEAD_DIM)
+    seq_lens_cpu, extend_lens_cpu, num_q = to_seq_extend(seq_extend)
+
+    with pytest.raises(RuntimeError):
+        ctx.make_prefill_plan(
+            seq_lens_cpu,
+            extend_lens_cpu,
+            num_q,
+            recompute_boundary=boundary,
+        )
+
+
+def test_boundary_device_must_match_seq_lens() -> None:
+    seq_extend = [(2 * PAGE, PAGE), (3 * PAGE, PAGE)]
+    ctx = make_paged_context(bs=len(seq_extend), compress_ratio=4, head_dim=HEAD_DIM)
+    seq_lens_cpu, extend_lens_cpu, num_q = to_seq_extend(seq_extend)
+    boundary = torch.tensor([PAGE, PAGE], dtype=torch.int64, device="cuda")
+
+    with pytest.raises(RuntimeError):
+        ctx.make_prefill_plan(
+            seq_lens_cpu,
+            extend_lens_cpu,
+            num_q,
+            recompute_boundary=boundary,
+        )
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
