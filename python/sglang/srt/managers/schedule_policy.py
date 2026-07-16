@@ -485,6 +485,7 @@ class PrefillAdder:
         # TODO(lsyin): report the real input tokens excluding page alignment
         self.log_input_tokens = 0
         self.reprocessed_log_input_tokens = 0
+
         if running_batch is not None:
             # Estimate the offset in the remaining token space
             self.rem_total_token_offset += sum(
@@ -1166,8 +1167,6 @@ class PrefillAdder:
                 # - if the can_run_list is empty, always accept the first prefill request
                 return AddReqResult.OTHER
 
-            chunk_budget_needed = forward_input_tokens
-
             if self.dllm_config is not None:
                 if self.rem_dllm_tokens <= 0:
                     return AddReqResult.OTHER
@@ -1180,7 +1179,7 @@ class PrefillAdder:
                 self._req_inc_lock_ref(req)
             elif (
                 self.rem_chunk_tokens is None
-                or chunk_budget_needed <= self.rem_chunk_tokens
+                or forward_input_tokens <= self.rem_chunk_tokens
             ):
                 # The full logical extend plus its recompute window fits.
                 req.set_extend_range(

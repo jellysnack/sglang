@@ -96,8 +96,6 @@ class CacheInitParams:
 
     swa_recompute_config: Optional[SWARecomputeConfig] = None
 
-    swa_checkpoint_interval: int = 0
-
     # Time-to-live for cache entries in seconds. If None, TTL is disabled.
     cache_ttl_seconds: Optional[float] = None
 

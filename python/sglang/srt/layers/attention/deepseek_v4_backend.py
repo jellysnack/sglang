@@ -1567,9 +1567,7 @@ class DeepseekV4AttnBackend(
         out_cache_loc writes to the dummy slot.
         """
         out_cache_loc = forward_batch.out_cache_loc
-        if (
-            override := getattr(forward_batch, "swa_out_cache_loc_override", None)
-        ) is not None:
+        if (override := forward_batch.swa_out_cache_loc_override) is not None:
             return override.to(torch.int32)
         core = getattr(self.forward_metadata, "core_attn_metadata", None)
         cached = core.swa_out_cache_loc if core is not None else None

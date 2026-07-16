@@ -62,25 +62,6 @@ class SWAComponent(TreeComponent):
         # HiCache state: set to host SWA pool when HiCache enabled
         self._swa_kv_pool_host = None
 
-        # Smallest page-aligned size that still covers the sliding window.
-        page_size = cache.page_size
-        self.window_tail_size = (
-            (self.sliding_window_size + page_size - 1) // page_size * page_size
-        )
-
-        self.checkpoint_interval = params.swa_checkpoint_interval
-        if self.checkpoint_interval > 0:
-            if self.checkpoint_interval % page_size != 0:
-                raise ValueError(
-                    f"hicache_swa_checkpoint_interval ({self.checkpoint_interval}) "
-                    f"must be a multiple of page_size ({page_size})."
-                )
-            if self.checkpoint_interval < self.sliding_window_size:
-                raise ValueError(
-                    f"hicache_swa_checkpoint_interval ({self.checkpoint_interval}) "
-                    f"must be >= sliding_window_size ({self.sliding_window_size})."
-                )
-
     component_type = ComponentType.SWA
 
     def _translate_full_to_swa(self, full_indices: torch.Tensor) -> torch.Tensor:
@@ -381,8 +362,6 @@ class SWAComponent(TreeComponent):
             return
 
         self._maybe_split_leaf_for_swa_lock(node)
-        self._maybe_split_for_recompute_gate(node)
-        self._maybe_split_for_checkpoints(node)
 
     def _maybe_split_leaf_for_swa_lock(self, leaf: UnifiedTreeNode) -> None:
         """Cap a fresh SWA leaf at one page-aligned window so locking it pins
@@ -404,67 +383,6 @@ class SWAComponent(TreeComponent):
             return
 
         self.cache._split_node(leaf.key, leaf, split_at)
-
-    def _maybe_split_for_checkpoints(self, leaf: UnifiedTreeNode) -> None:
-        """Carve a window-sized tail at every k*N boundary inside SWA-bearing
-        ancestors so the L3 gate persists only those tails, not whole chunks.
-        """
-        if self.checkpoint_interval <= 0:
-            return
-
-        ct = self.component_type
-        N = self.checkpoint_interval
-        W_tail = self.window_tail_size
-
-        cur = leaf
-        while (
-            cur is not self.cache.root_node and cur.component_data[ct].value is not None
-        ):
-            original_parent = cur.parent
-            start = cur.seqlen_start
-            end = start + len(cur.key)
-
-            split_points = set()
-            for k in range(start // N + 1, (end - 1) // N + 1):
-                split_points.add(k * N)
-            for k in range((start + W_tail) // N + 1, (end + W_tail - 1) // N + 1):
-                split_points.add(k * N - W_tail)
-
-            for p in sorted(p for p in split_points if start < p < end):
-                offset = p - cur.seqlen_start
-                if 0 < offset < len(cur.key):
-                    self.cache._split_node(cur.key, cur, offset)
-
-            cur = original_parent
-
-    def _maybe_split_for_recompute_gate(self, leaf: UnifiedTreeNode) -> None:
-        gate = self._swa_storage_recompute_gate_threshold()
-        if gate is None:
-            return
-
-        ct = self.component_type
-        cur = leaf
-        while (
-            cur is not self.cache.root_node and cur.component_data[ct].value is not None
-        ):
-            original_parent = cur.parent
-            start = cur.seqlen_start
-            end = start + len(cur.key)
-            if start < gate < end:
-                self.cache._split_node(cur.key, cur, gate - start)
-            cur = original_parent
-
-    def _is_checkpoint_tail_node(self, node: UnifiedTreeNode) -> bool:
-        N = self.checkpoint_interval
-        cp = (node.seqlen_start // N + 1) * N
-        return (
-            node.seqlen_start >= cp - self.window_tail_size
-            and node.seqlen_start + len(node.key) <= cp
-        )
-
-    def _is_below_recompute_gate_node(self, node: UnifiedTreeNode) -> bool:
-        gate = self._swa_storage_recompute_gate_threshold()
-        return gate is not None and node.seqlen_start + len(node.key) <= gate
 
     def redistribute_on_node_split(
         self, new_parent: UnifiedTreeNode, child: UnifiedTreeNode
@@ -882,12 +800,6 @@ class SWAComponent(TreeComponent):
                 return None
             num_pages = len(cd.host_value) // self.cache.page_size
             if num_pages == 0:
-                return None
-            if (
-                self.checkpoint_interval > 0
-                and not self._is_checkpoint_tail_node(node)
-                and not self._is_below_recompute_gate_node(node)
-            ):
                 return None
             return [
                 PoolTransfer(

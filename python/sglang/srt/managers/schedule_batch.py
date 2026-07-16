@@ -2272,7 +2272,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 f"{self.extend_num_tokens=}"
             )
         except Exception:
-            self.abort_swa_recompute()
+            self.abort_pending_swa_recompute()
             raise
 
     def commit_swa_recompute(self) -> None:
@@ -2326,8 +2326,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.swa_recompute_txns = None
         self.swa_out_cache_loc_override = None
 
-    def abort_swa_recompute(self) -> None:
-        """Release private SWA pages allocated for an uncommitted recompute."""
+    def abort_pending_swa_recompute(self) -> None:
+        """Release private SWA pages if this batch has an uncommitted recompute."""
         txns = self.swa_recompute_txns
         if not txns:
             self.swa_recompute_txns = None

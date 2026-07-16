@@ -1542,7 +1542,7 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
-                result = self.run_batch_with_swa_recompute_cleanup(batch)
+                result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states.
@@ -1603,7 +1603,7 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
-                batch_result = self.run_batch_with_swa_recompute_cleanup(batch)
+                batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
@@ -3276,7 +3276,7 @@ class Scheduler(
                 batch.sampling_info = sched_sampling_info
 
     @scheduler_nvtx_method("scheduler.run_batch")
-    def run_batch(
+    def _run_batch(
         self,
         batch: ScheduleBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
@@ -3479,15 +3479,16 @@ class Scheduler(
 
         return ret
 
-    def run_batch_with_swa_recompute_cleanup(
+    def run_batch(
         self,
         batch: ScheduleBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
+        """Run a batch and release uncommitted resources if forwarding fails."""
         try:
-            return self.run_batch(batch, pp_proxy_tensors=pp_proxy_tensors)
+            return self._run_batch(batch, pp_proxy_tensors=pp_proxy_tensors)
         except BaseException:
-            batch.abort_swa_recompute()
+            batch.abort_pending_swa_recompute()
             raise
 
     def _maybe_report_active_ranks(self) -> None:

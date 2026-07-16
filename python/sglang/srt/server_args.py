@@ -2174,13 +2174,6 @@ class ServerArgs:
         Optional[str],
         "A dictionary in JSON string format, or a string starting with a leading '@' and a config file in JSON/YAML/TOML format, containing extra configuration for the storage backend.",
     ] = None
-    hicache_swa_checkpoint_interval: A[
-        int,
-        "Persist SWA pages to L3 storage only at sequence positions that are "
-        "multiples of N tokens. 0 disables checkpoint filtering. When positive, "
-        "N must be page-aligned and at least the sliding-window size.",
-    ] = 0
-
     # -------------------------------------------------------------------------
     # Hierarchical sparse attention
     # -------------------------------------------------------------------------
@@ -5785,21 +5778,6 @@ class ServerArgs:
 
         # Step 2: Storage-layout normalization without changing io backend.
         self._resolve_storage_layout_compatibility()
-
-        # The sliding-window lower bound is checked in SWAComponent because
-        # that value is derived per worker and is unavailable here.
-        if self.hicache_swa_checkpoint_interval > 0:
-            page_size = self.page_size
-            if (
-                page_size is not None
-                and page_size > 0
-                and self.hicache_swa_checkpoint_interval % page_size != 0
-            ):
-                raise ValueError(
-                    "--hicache-swa-checkpoint-interval "
-                    f"({self.hicache_swa_checkpoint_interval}) must be a multiple "
-                    f"of --page-size ({page_size})."
-                )
 
     def _resolve_layout_io_compatibility(self):
         if (

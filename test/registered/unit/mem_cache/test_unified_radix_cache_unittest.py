@@ -649,32 +649,18 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
 
 
 class TestUnifiedSWARecomputeWindowSizing(CustomTestCase):
-    def test_window_covers_page_aligned_committed_tail(self):
-        cfg = CacheConfig(
-            page_size=256,
-            components=(ComponentType.FULL, ComponentType.SWA),
-            sliding_window_size=128,
-            swa_num_layers=42,
-            kv_size=8192,
-            max_context_len=8192,
-        )
-        tree, _, _ = build_fixture(cfg)
-        swa = tree.components[ComponentType.SWA]
+    def test_from_dimensions_aligns_window_and_gate(self):
+        for multiplier, expected_gate in ((2.0, 11264), (1.5, 8448)):
+            with self.subTest(multiplier=multiplier):
+                config = SWARecomputeConfig.from_dimensions(
+                    sliding_window_size=128,
+                    num_swa_layers=42,
+                    page_size=256,
+                    gate_multiplier=multiplier,
+                )
 
-        self.assertEqual(swa.recompute_config.window_size, 5632)
-        self.assertEqual(swa.swa_recompute_gate_threshold(), 11264)
-
-    def test_gate_multiplier_is_page_aligned(self):
-        with envs.SGLANG_SWA_RECOMPUTE_GATE_MULTIPLIER.override(1.5):
-            config = SWARecomputeConfig.from_dimensions(
-                sliding_window_size=128,
-                num_swa_layers=42,
-                page_size=256,
-                gate_multiplier=envs.SGLANG_SWA_RECOMPUTE_GATE_MULTIPLIER.get(),
-            )
-
-        self.assertEqual(config.window_size, 5632)
-        self.assertEqual(config.gate_threshold, 8448)
+                self.assertEqual(config.window_size, 5632)
+                self.assertEqual(config.gate_threshold, expected_gate)
 
     def test_gate_multiplier_must_be_at_least_one(self):
         with self.assertRaisesRegex(ValueError, "at least 1"):
@@ -686,7 +672,7 @@ class TestUnifiedSWARecomputeWindowSizing(CustomTestCase):
             )
 
 
-class UnifiedRadixCacheSuite:
+class UnifiedRadixCacheTestMixin:
 
     cfg: CacheConfig
     _rid: int = 0
@@ -745,6 +731,9 @@ class UnifiedRadixCacheSuite:
             req = self._make_req(req_to_token_pool)
             params.mamba_value = req.mamba_pool_idx.unsqueeze(0)
         return cache.insert(params)
+
+
+class UnifiedRadixCacheSuite(UnifiedRadixCacheTestMixin):
 
     def test_insert_and_match_basic(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
@@ -1599,38 +1588,6 @@ class UnifiedRadixCacheSuite:
         self.assertTrue(cache._is_device_leaf(node_a))
         cache.sanity_check()
 
-    def test_dec_lock_ref_honors_explicit_skip_swa(self):
-        if not self.cfg.has_swa or self.cfg.has_mamba:
-            self.skipTest("requires SWA without Mamba")
-
-        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
-        window_pages = (
-            self.cfg.sliding_window_size + self.cfg.page_size - 1
-        ) // self.cfg.page_size
-        seq = self._make_seq(1, window_pages + 1)
-        self._insert(cache, allocator, req_to_token_pool, seq)
-        node = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", seq)))
-        ).last_device_node
-
-        lock_result = cache.inc_lock_ref(node)
-        swa_data = node.component_data[ComponentType.SWA]
-        full_data = node.component_data[ComponentType.FULL]
-        swa_lock_ref = swa_data.lock_ref
-        full_lock_ref = full_data.lock_ref
-        self.assertGreater(swa_lock_ref, 0)
-        self.assertGreater(full_lock_ref, 0)
-
-        cache.dec_lock_ref(node, lock_result.to_dec_params(), skip_swa=True)
-
-        self.assertEqual(swa_data.lock_ref, swa_lock_ref)
-        self.assertLess(full_data.lock_ref, full_lock_ref)
-
-        full_only_lock = cache.inc_lock_ref_for_swa_recompute(node)
-        cache.dec_swa_lock_only(node, lock_result.swa_uuid_for_lock)
-        cache.dec_lock_ref(node, full_only_lock.to_dec_params())
-        cache.sanity_check()
-
     def test_swa_leaf_capped_to_window_on_insert(self):
         """A long SWA leaf is split so locking it protects one window of SWA
         while full attention still protects the whole sequence."""
@@ -2291,245 +2248,6 @@ class UnifiedRadixCacheSuite:
         extra = self._make_seq(9000, 2)
         self._insert(cache, allocator, req_to_token_pool, extra)
         cache.sanity_check()
-
-    # ================================================================
-    # SWA-window recompute (SGLANG_OPT_SWA_RECOMPUTE_WINDOW)
-    # ================================================================
-
-    def _enable_swa_recompute(self, tree):
-        """Configure recompute sizing for SWA test fixtures."""
-        swa = tree.components[ComponentType.SWA]
-        swa.recompute_config = SWARecomputeConfig.from_dimensions(
-            sliding_window_size=swa.sliding_window_size,
-            num_swa_layers=1,
-            page_size=tree.page_size,
-            gate_multiplier=envs.SGLANG_SWA_RECOMPUTE_GATE_MULTIPLIER.get(),
-        )
-        return swa
-
-    def test_swa_recompute_zero_when_all_live(self):
-        if not self.cfg.has_swa:
-            self.skipTest("requires SWA component")
-        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
-        self._enable_swa_recompute(tree)
-        seq = self._make_seq(1, 4)
-        self._insert(tree, allocator, req_to_token_pool, seq)
-
-        with envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.override(True):
-            result = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
-        self.assertEqual(result.swa_recompute_len, 0)
-        self.assertEqual(result.device_indices.shape[0], len(seq))
-
-    def test_swa_recompute_uses_host_swa_without_recompute(self):
-        """Host SWA is a valid hit and should not force recompute."""
-        if not self.cfg.has_swa:
-            self.skipTest("requires SWA component")
-        if self.cfg.has_mamba:
-            self.skipTest("SWA-only path keeps the setup simple")
-        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
-        self._enable_swa_recompute(tree)
-        n_pages = 4
-        seq = self._make_seq(1, n_pages)
-        self._insert(tree, allocator, req_to_token_pool, seq)
-
-        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
-        leaf = m.last_device_node
-        self.assertIsNot(leaf, tree.root_node, "need at least one matched node")
-        cd_full = leaf.component_data[ComponentType.FULL]
-        self.assertIsNotNone(cd_full.value)
-        cd_swa = leaf.component_data[ComponentType.SWA]
-        self.assertIsNotNone(cd_swa.value)
-        cd_full.host_value = cd_full.value.clone()
-        cd_full.value = None
-        cd_swa.host_value = cd_swa.value.clone()
-        cd_swa.value = None
-
-        with envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.override(True):
-            result = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
-
-        self.assertEqual(result.swa_recompute_len, 0)
-        self.assertGreater(result.host_hit_length, 0)
-        self.assertGreater(result.swa_host_hit_length, 0)
-
-    def test_swa_recompute_arms_on_host_full_missing_swa_tail(self):
-        """Host/storage FULL hit with no SWA tail must arm recompute."""
-        if not self.cfg.has_swa:
-            self.skipTest("requires SWA component")
-        if self.cfg.has_mamba:
-            self.skipTest("SWA-only path keeps the setup simple")
-        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
-        swa = self._enable_swa_recompute(tree)
-        page_size = self.cfg.page_size
-        gate_pages = (swa.swa_recompute_gate_threshold() + page_size - 1) // page_size
-        n_pages = gate_pages + 1
-        seq = self._make_seq(1, n_pages)
-        self._insert(tree, allocator, req_to_token_pool, seq)
-
-        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
-        leaf = m.last_device_node
-        self.assertIsNot(leaf, tree.root_node, "need at least one matched node")
-        cd_full = leaf.component_data[ComponentType.FULL]
-        self.assertIsNotNone(cd_full.value)
-        cd_full.host_value = cd_full.value.clone()
-        cd_full.value = None
-        cd_swa = leaf.component_data[ComponentType.SWA]
-        cd_swa.value = None
-        cd_swa.host_value = None
-
-        with envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.override(True):
-            result = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
-
-        self.assertGreater(result.swa_recompute_len, 0)
-        self.assertGreater(result.host_hit_length, 0)
-        self.assertEqual(result.swa_host_hit_length, 0)
-
-    def test_swa_recompute_gated_host_full_missing_swa_falls_back(self):
-        """Short host FULL hits without SWA must not become unsafe hits."""
-        if not self.cfg.has_swa:
-            self.skipTest("requires SWA component")
-        if self.cfg.has_mamba:
-            self.skipTest("SWA-only path keeps the setup simple")
-        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
-        self._enable_swa_recompute(tree)
-        seq = self._make_seq(1, 1)
-        self._insert(tree, allocator, req_to_token_pool, seq)
-
-        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
-        leaf = m.last_device_node
-        self.assertIsNot(leaf, tree.root_node, "need at least one matched node")
-        cd_full = leaf.component_data[ComponentType.FULL]
-        cd_full.host_value = cd_full.value.clone()
-        cd_full.value = None
-        cd_swa = leaf.component_data[ComponentType.SWA]
-        cd_swa.value = None
-        cd_swa.host_value = None
-
-        with mock.patch.object(
-            tree, "_walk_full_prefix", wraps=tree._walk_full_prefix
-        ) as walk_full_prefix, envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.override(True):
-            result = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
-
-        self.assertEqual(walk_full_prefix.call_count, 1)
-        self.assertEqual(result.swa_recompute_len, 0)
-        self.assertEqual(result.host_hit_length, 0)
-        self.assertEqual(len(result.device_indices), 0)
-
-    def test_hicache_swa_load_back_requires_armed_recompute_for_missing_swa(self):
-        """LOAD_BACK must not silently skip missing SWA unless recompute is armed."""
-        if not self.cfg.has_swa:
-            self.skipTest("requires SWA component")
-        if self.cfg.has_mamba:
-            self.skipTest("SWA-only path keeps the setup simple")
-        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
-        self._enable_swa_recompute(tree)
-        seq = self._make_seq(1, 2)
-        self._insert(tree, allocator, req_to_token_pool, seq)
-
-        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
-        leaf = m.last_device_node
-        cd_full = leaf.component_data[ComponentType.FULL]
-        cd_full.host_value = cd_full.value.clone()
-        cd_swa = leaf.component_data[ComponentType.SWA]
-        cd_swa.value = None
-        cd_swa.host_value = None
-        swa_comp = tree.components[ComponentType.SWA]
-
-        with envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.override(True):
-            with self.assertRaises(AssertionError):
-                swa_comp.build_hicache_transfers(
-                    leaf, CacheTransferPhase.LOAD_BACK, req=None
-                )
-
-            req = self._make_req(req_to_token_pool)
-            req.swa_recompute_len = swa_comp.swa_recompute_window_size()
-            self.assertIsNone(
-                swa_comp.build_hicache_transfers(
-                    leaf, CacheTransferPhase.LOAD_BACK, req=req
-                )
-            )
-
-    def test_swa_recompute_materializes_host_only_tail(self):
-        """Fresh recompute commit must turn host-only SWA into device SWA."""
-        if not self.cfg.has_swa:
-            self.skipTest("requires SWA component")
-        if self.cfg.has_mamba:
-            self.skipTest("SWA-only path keeps the setup simple")
-        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
-        self._enable_swa_recompute(tree)
-        seq = self._make_seq(1, 2)
-        self._insert(tree, allocator, req_to_token_pool, seq)
-
-        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
-        leaf = m.last_device_node
-        self.assertIsNot(leaf, tree.root_node, "need at least one matched node")
-        cd_full = leaf.component_data[ComponentType.FULL]
-        cd_swa = leaf.component_data[ComponentType.SWA]
-        self.assertIsNotNone(cd_full.value)
-        self.assertIsNotNone(cd_swa.value)
-
-        cd_swa.host_value = cd_swa.value.clone()
-        tree._evict_component_and_detach_lru(
-            leaf,
-            tree.components[ComponentType.SWA],
-            target=EvictLayer.DEVICE,
-        )
-        self.assertIsNone(cd_swa.value)
-        self.assertIsNotNone(cd_swa.host_value)
-        self.assertTrue(tree.host_lru_lists[ComponentType.SWA].in_list(leaf))
-
-        fresh_swa = allocator.alloc_fresh_swa_for_recompute_window(cd_full.value)
-        self.assertIsNotNone(fresh_swa)
-        allocator.commit_fresh_swa_for_recompute_window(cd_full.value, fresh_swa)
-        materialized = tree.revive_swa_tombstone_window(leaf, len(cd_full.value))
-
-        self.assertEqual(materialized, len(cd_full.value))
-        self.assertIsNotNone(cd_swa.value)
-        self.assertTrue(
-            torch.equal(
-                cd_swa.value,
-                allocator.translate_loc_from_full_to_swa(cd_full.value),
-            )
-        )
-        self.assertFalse(tree.host_lru_lists[ComponentType.SWA].in_list(leaf))
-
-    def test_swa_recompute_completes_full_only_lock(self):
-        if not self.cfg.has_swa or self.cfg.has_mamba:
-            self.skipTest("requires SWA without Mamba")
-        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
-        self._enable_swa_recompute(tree)
-        seq = self._make_seq(1, 2)
-        self._insert(tree, allocator, req_to_token_pool, seq)
-
-        match = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
-        leaf = match.last_device_node
-        full_data = leaf.component_data[ComponentType.FULL]
-        swa_data = leaf.component_data[ComponentType.SWA]
-        recompute_len = len(swa_data.value)
-        tree._evict_component_and_detach_lru(
-            leaf,
-            tree.components[ComponentType.SWA],
-            target=EvictLayer.DEVICE,
-        )
-        fresh_swa = allocator.alloc_fresh_swa_for_recompute_window(full_data.value)
-        self.assertIsNotNone(fresh_swa)
-        allocator.commit_fresh_swa_for_recompute_window(full_data.value, fresh_swa)
-
-        lock_result = tree.inc_lock_ref_for_swa_recompute(leaf)
-        req = self._make_req(req_to_token_pool)
-        req.last_node = leaf
-        req.swa_prefix_lock_released = lock_result.swa_skipped
-        tree.complete_swa_recompute_lock(req, recompute_len)
-
-        self.assertGreater(full_data.lock_ref, 0)
-        self.assertGreater(swa_data.lock_ref, 0)
-        self.assertFalse(req.swa_prefix_lock_released)
-        self.assertIsNotNone(req.swa_uuid_for_lock)
-
-        tree.dec_lock_ref(
-            leaf,
-            DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock),
-        )
-        tree.sanity_check()
 
     # ================================================================
     # HiCache Unit Tests (real cache_controller D<->H backup/load)
@@ -4554,345 +4272,213 @@ for _cfg in _CONFIGS:
 del _cfg, _name
 
 
-_SWA_CP_PAGE_SIZE = 256
-_SWA_CP_W = 128
-_SWA_CP_W_TAIL = _SWA_CP_PAGE_SIZE
-_SWA_CP_CHUNK = 8192
-
-
-class TestSWACheckpointSplit(CustomTestCase):
-    """SWA periodic L3 checkpoint splitting: covers N<chunk, N==chunk, N>chunk."""
-
-    # kv_size must cover cumulative allocations across chained inserts:
-    # the suite's allocator does not reclaim prefix tokens between calls.
+class TestUnifiedSWARecompute(UnifiedRadixCacheTestMixin, CustomTestCase):
     cfg = CacheConfig(
-        page_size=_SWA_CP_PAGE_SIZE,
+        page_size=256,
         components=(ComponentType.FULL, ComponentType.SWA),
-        sliding_window_size=_SWA_CP_W,
-        swa_num_layers=1,
-        kv_size=8 * _SWA_CP_CHUNK,
+        num_layers=3,
+        full_attention_layer_ids=(2,),
+        sliding_window_size=128,
+        swa_num_layers=2,
+        kv_size=4096,
         max_num_reqs=4,
-        max_context_len=8 * _SWA_CP_CHUNK,
+        max_context_len=4096,
         head_num=1,
         head_dim=8,
     )
 
-    def _set_checkpoint_interval(self, tree, interval: int) -> None:
-        tree.components[ComponentType.SWA].checkpoint_interval = interval
+    def _build_inserted(self, num_pages: int):
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        seq = self._make_seq(1, num_pages)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+        leaf = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", seq)))
+        ).last_device_node
+        return tree, allocator, req_to_token_pool, seq, leaf
 
-    def _alloc_swa(self, allocator, need_size: int):
-        ps = _SWA_CP_PAGE_SIZE
-        aligned = ((need_size + ps - 1) // ps) * ps
-        full = allocator.full_attn_allocator.alloc(aligned)
-        swa = allocator.swa_attn_allocator.alloc(aligned)
-        assert full is not None and swa is not None
-        allocator.full_to_swa_index_mapping[full] = swa
-        return full[:need_size]
-
-    def _insert_chunk(self, tree, allocator, base: int, num_tokens: int) -> None:
-        tokens = list(range(1, 1 + base + num_tokens))
-        value = self._alloc_swa(allocator, len(tokens))
-        tree.insert(
-            InsertParams(
-                key=RadixKey(array("q", tokens)),
-                value=value,
-                swa_evicted_seqlen=0,
-            )
-        )
-
-    def _chain_from_root(self, tree):
+    @staticmethod
+    def _chain_from_root(tree):
         chain = []
         node = tree.root_node
         while len(node.children) == 1:
-            child = next(iter(node.children.values()))
-            chain.append(child)
-            node = child
+            node = next(iter(node.children.values()))
+            chain.append(node)
         return chain
 
-    def _shape(self, tree):
-        chain = self._chain_from_root(tree)
-        lengths = [len(n.key) for n in chain]
-        starts = [n.seqlen_start for n in chain]
-        ends = [s + l for s, l in zip(starts, lengths)]
-        return chain, lengths, starts, ends
+    def test_live_swa_tail_does_not_recompute(self):
+        for state in ("host_tail", "old_tombstone"):
+            with self.subTest(state=state):
+                tree, _, _, seq, leaf = self._build_inserted(3)
+                if state == "host_tail":
+                    full_data = leaf.component_data[ComponentType.FULL]
+                    swa_data = leaf.component_data[ComponentType.SWA]
+                    full_data.host_value = full_data.value.clone()
+                    full_data.value = None
+                    swa_data.host_value = swa_data.value.clone()
+                    swa_data.value = None
+                else:
+                    old_prefix = self._chain_from_root(tree)[0]
+                    tree._evict_component_and_detach_lru(
+                        old_prefix,
+                        tree.components[ComponentType.SWA],
+                        target=EvictLayer.DEVICE,
+                    )
 
-    def _tail_count(self, tree) -> int:
-        swa = tree.components[ComponentType.SWA]
-        chain, *_ = self._shape(tree)
-        return sum(1 for n in chain if swa._is_checkpoint_tail_node(n))
+                with envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.override(True):
+                    result = tree.match_prefix(
+                        MatchPrefixParams(key=RadixKey(array("q", seq)))
+                    )
 
-    def _attach_swa_host_values(self, tree) -> None:
-        for node in self._chain_from_root(tree):
-            cd = node.component_data[ComponentType.SWA]
-            cd.host_value = cd.value.clone()
+                self.assertEqual(result.swa_recompute_len, 0)
+                if state == "host_tail":
+                    self.assertGreater(result.host_hit_length, 0)
+                    self.assertGreater(result.swa_host_hit_length, 0)
+                else:
+                    self.assertEqual(len(result.device_indices), len(seq))
 
-    def test_n_less_than_chunk_splits_into_two_checkpoints(self):
-        """N=4096, chunked=8192: one 8k insert yields [3840, 256, 3840, 256]."""
-        tree, allocator, _ = build_fixture(self.cfg)
-        self._set_checkpoint_interval(tree, 4096)
+    def test_missing_swa_tail_above_gate_arms_recompute(self):
+        tree, _, _, seq, leaf = self._build_inserted(5)
+        full_data = leaf.component_data[ComponentType.FULL]
+        swa_data = leaf.component_data[ComponentType.SWA]
+        full_data.host_value = full_data.value.clone()
+        full_data.value = None
+        swa_data.value = None
+        swa_data.host_value = None
 
-        self._insert_chunk(tree, allocator, base=0, num_tokens=_SWA_CP_CHUNK)
-
-        chain, lengths, starts, _ = self._shape(tree)
-        N, W = 4096, _SWA_CP_W_TAIL
-        self.assertEqual(lengths, [N - W, W, N - W, W])
-        self.assertEqual(starts, [0, N - W, N, _SWA_CP_CHUNK - W])
-
-        swa = tree.components[ComponentType.SWA]
-        self.assertEqual(
-            [swa._is_checkpoint_tail_node(n) for n in chain],
-            [False, True, False, True],
-        )
-        tree.sanity_check()
-
-    def test_n_equals_chunk_uses_lock_cap_tail_as_checkpoint(self):
-        """N=8192, chunked=8192: lock-cap tail ends on N and is admitted."""
-        tree, allocator, _ = build_fixture(self.cfg)
-        self._set_checkpoint_interval(tree, _SWA_CP_CHUNK)
-
-        self._insert_chunk(tree, allocator, base=0, num_tokens=_SWA_CP_CHUNK)
-
-        chain, lengths, _, ends = self._shape(tree)
-        self.assertEqual(lengths, [_SWA_CP_CHUNK - _SWA_CP_W_TAIL, _SWA_CP_W_TAIL])
-        self.assertEqual(ends[-1], _SWA_CP_CHUNK)
+        with envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.override(True):
+            result = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
 
         swa = tree.components[ComponentType.SWA]
-        self.assertEqual(
-            [swa._is_checkpoint_tail_node(n) for n in chain], [False, True]
-        )
-        tree.sanity_check()
+        self.assertEqual(result.swa_recompute_len, swa.swa_recompute_window_size())
+        self.assertGreater(result.host_hit_length, 0)
+        self.assertEqual(result.swa_host_hit_length, 0)
 
-    def test_n_greater_than_chunk_only_admits_aligned_chunk_tails(self):
-        """N=12288, chunked=8192: tail admitted only when end == k*N."""
-        tree, allocator, _ = build_fixture(self.cfg)
-        N = 12288
-        self._set_checkpoint_interval(tree, N)
+    def test_missing_swa_tail_below_gate_falls_back(self):
+        tree, _, _, seq, leaf = self._build_inserted(1)
+        full_data = leaf.component_data[ComponentType.FULL]
+        swa_data = leaf.component_data[ComponentType.SWA]
+        full_data.host_value = full_data.value.clone()
+        full_data.value = None
+        swa_data.value = None
+        swa_data.host_value = None
 
-        # chunk1: ends on 8192, no k*N strictly inside.
-        self._insert_chunk(tree, allocator, base=0, num_tokens=_SWA_CP_CHUNK)
-        _, lengths1, *_ = self._shape(tree)
-        self.assertEqual(lengths1, [_SWA_CP_CHUNK - _SWA_CP_W_TAIL, _SWA_CP_W_TAIL])
-        self.assertEqual(self._tail_count(tree), 0)
+        with mock.patch.object(
+            tree, "_walk_full_prefix", wraps=tree._walk_full_prefix
+        ) as walk_full_prefix, envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.override(True):
+            result = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
 
-        # chunk2: 8192..16384, k*N=12288 lies inside -> one checkpoint tail.
-        self._insert_chunk(
-            tree, allocator, base=_SWA_CP_CHUNK, num_tokens=_SWA_CP_CHUNK
-        )
-        chain2, _, _, ends2 = self._shape(tree)
-        self.assertIn(N, ends2)
-        cp_tails = [n for n in chain2 if (n.seqlen_start + len(n.key)) % N == 0]
-        self.assertEqual(len(cp_tails), 1)
-        self.assertEqual(len(cp_tails[0].key), _SWA_CP_W_TAIL)
-        self.assertEqual(self._tail_count(tree), 1)
-        tree.sanity_check()
+        self.assertEqual(walk_full_prefix.call_count, 1)
+        self.assertEqual(result.swa_recompute_len, 0)
+        self.assertEqual(result.host_hit_length, 0)
+        self.assertEqual(len(result.device_indices), 0)
 
-        # chunk3: 16384..24576, lock-cap tail ends on 2*N -> recognized.
-        self._insert_chunk(
-            tree, allocator, base=2 * _SWA_CP_CHUNK, num_tokens=_SWA_CP_CHUNK
-        )
-        ends3 = self._shape(tree)[3]
-        self.assertIn(N, ends3)
-        self.assertIn(2 * N, ends3)
-        self.assertEqual(self._tail_count(tree), 2)
-        tree.sanity_check()
-
-    def test_disabled_interval_keeps_baseline_lock_cap_split(self):
-        """checkpoint_interval=0: only the lock-cap tail split fires."""
-        tree, allocator, _ = build_fixture(self.cfg)
-        self._insert_chunk(tree, allocator, base=0, num_tokens=_SWA_CP_CHUNK)
-        _, lengths, starts, _ = self._shape(tree)
-        self.assertEqual(lengths, [_SWA_CP_CHUNK - _SWA_CP_W_TAIL, _SWA_CP_W_TAIL])
-        self.assertEqual(starts, [0, _SWA_CP_CHUNK - _SWA_CP_W_TAIL])
-        tree.sanity_check()
-
-    def test_storage_backup_checkpoint_disabled_keeps_all_swa_pages(self):
-        tree, allocator, _ = build_fixture(self.cfg)
-        tree.enable_storage = True
-        self._set_checkpoint_interval(tree, 0)
-        self._insert_chunk(tree, allocator, base=0, num_tokens=2 * _SWA_CP_PAGE_SIZE)
-        self._attach_swa_host_values(tree)
-        node = self._chain_from_root(tree)[0]
-
-        transfers = tree.components[ComponentType.SWA].build_hicache_transfers(
-            node, CacheTransferPhase.BACKUP_STORAGE
-        )
-
-        self.assertIsNotNone(transfers)
-        self.assertEqual(transfers[0].host_indices.numel(), len(node.key))
-        self.assertEqual(len(transfers[0].keys), len(node.key) // _SWA_CP_PAGE_SIZE)
-
-    def test_storage_backup_keeps_short_prefix_swa_for_recompute_gate(self):
-        tree, allocator, _ = build_fixture(self.cfg)
-        tree.enable_storage = True
-        self._set_checkpoint_interval(tree, _SWA_CP_CHUNK)
-        self._insert_chunk(tree, allocator, base=0, num_tokens=2 * _SWA_CP_PAGE_SIZE)
-        self._attach_swa_host_values(tree)
-        node = self._chain_from_root(tree)[0]
+    def test_load_back_skips_missing_swa_only_for_armed_recompute(self):
+        tree, _, req_to_token_pool, _, leaf = self._build_inserted(2)
+        swa_data = leaf.component_data[ComponentType.SWA]
+        swa_data.value = None
+        swa_data.host_value = None
         swa = tree.components[ComponentType.SWA]
 
+        with self.assertRaises(AssertionError):
+            swa.build_hicache_transfers(leaf, CacheTransferPhase.LOAD_BACK, req=None)
+
+        req = self._make_req(req_to_token_pool)
+        req.swa_recompute_len = swa.swa_recompute_window_size()
         self.assertIsNone(
-            swa.build_hicache_transfers(node, CacheTransferPhase.BACKUP_STORAGE)
-        )
-        with envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.override(True):
-            transfers = swa.build_hicache_transfers(
-                node,
-                CacheTransferPhase.BACKUP_STORAGE,
-            )
-
-        self.assertIsNotNone(transfers)
-        self.assertEqual(transfers[0].host_indices.numel(), len(node.key))
-
-    def test_storage_backup_keeps_prefix_below_recompute_gate_only(self):
-        tree, allocator, _ = build_fixture(self.cfg)
-        tree.enable_storage = True
-        self._set_checkpoint_interval(tree, 1024 * _SWA_CP_CHUNK)
-        swa = tree.components[ComponentType.SWA]
-        gate = swa.swa_recompute_gate_threshold()
-        with envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.override(True):
-            self._insert_chunk(
-                tree, allocator, base=0, num_tokens=gate + _SWA_CP_PAGE_SIZE
-            )
-        self._attach_swa_host_values(tree)
-
-        chain = self._chain_from_root(tree)
-        self.assertIn(gate, [n.seqlen_start + len(n.key) for n in chain])
-        self.assertFalse(
-            any(n.seqlen_start < gate < n.seqlen_start + len(n.key) for n in chain)
+            swa.build_hicache_transfers(leaf, CacheTransferPhase.LOAD_BACK, req=req)
         )
 
-        with envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.override(True):
-            below_gate = [n for n in chain if n.seqlen_start + len(n.key) <= gate]
-            above_gate = [
-                n
-                for n in chain
-                if n.seqlen_start >= gate and not swa._is_checkpoint_tail_node(n)
-            ]
-            self.assertTrue(below_gate)
-            self.assertTrue(above_gate)
+    def test_complete_recompute_materializes_tail_and_upgrades_lock(self):
+        tree, allocator, req_to_token_pool, seq, leaf = self._build_inserted(2)
+        full_data = leaf.component_data[ComponentType.FULL]
+        swa_data = leaf.component_data[ComponentType.SWA]
+        for node in self._chain_from_root(tree):
+            node_full_data = node.component_data[ComponentType.FULL]
+            node_full_data.host_value = node_full_data.value.clone()
+        swa_data.host_value = swa_data.value.clone()
+        tree._evict_component_and_detach_lru(
+            leaf,
+            tree.components[ComponentType.SWA],
+            target=EvictLayer.DEVICE,
+        )
+        self.assertTrue(tree.host_lru_lists[ComponentType.SWA].in_list(leaf))
 
-            for node in below_gate:
-                self.assertIsNotNone(
-                    swa.build_hicache_transfers(node, CacheTransferPhase.BACKUP_STORAGE)
-                )
-            for node in above_gate:
-                self.assertIsNone(
-                    swa.build_hicache_transfers(node, CacheTransferPhase.BACKUP_STORAGE)
-                )
+        fresh_swa = allocator.alloc_fresh_swa_for_recompute_window(full_data.value)
+        self.assertIsNotNone(fresh_swa)
+        allocator.commit_fresh_swa_for_recompute_window(full_data.value, fresh_swa)
 
-    def test_prefetch_swa_optional_when_total_prefix_reaches_recompute_gate(self):
-        tree, allocator, _ = build_fixture(self.cfg)
-        self._insert_chunk(tree, allocator, base=0, num_tokens=2 * _SWA_CP_PAGE_SIZE)
-        node = self._chain_from_root(tree)[0]
+        lock_result = tree.inc_lock_ref_for_swa_recompute(leaf)
+        req = self._make_req(req_to_token_pool)
+        req.last_node = leaf
+        req.swa_prefix_lock_released = lock_result.swa_skipped
+        tree.complete_swa_recompute_lock(req, len(seq))
+
+        self.assertGreater(full_data.lock_ref, 0)
+        self.assertGreater(swa_data.lock_ref, 0)
+        self.assertFalse(req.swa_prefix_lock_released)
+        self.assertIsNotNone(req.swa_uuid_for_lock)
+        self.assertTrue(
+            torch.equal(
+                swa_data.value,
+                allocator.translate_loc_from_full_to_swa(full_data.value),
+            )
+        )
+        self.assertFalse(tree.host_lru_lists[ComponentType.SWA].in_list(leaf))
+
+        tree.dec_lock_ref(
+            leaf,
+            DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock),
+        )
+        tree.sanity_check()
+
+    def test_dec_lock_ref_honors_explicit_skip_swa(self):
+        tree, _, _, _, leaf = self._build_inserted(2)
+        lock_result = tree.inc_lock_ref(leaf)
+        swa_data = leaf.component_data[ComponentType.SWA]
+        full_data = leaf.component_data[ComponentType.FULL]
+        swa_lock_ref = swa_data.lock_ref
+        full_lock_ref = full_data.lock_ref
+
+        tree.dec_lock_ref(leaf, lock_result.to_dec_params(), skip_swa=True)
+
+        self.assertEqual(swa_data.lock_ref, swa_lock_ref)
+        self.assertLess(full_data.lock_ref, full_lock_ref)
+
+        full_only_lock = tree.inc_lock_ref_for_swa_recompute(leaf)
+        tree.dec_swa_lock_only(leaf, lock_result.swa_uuid_for_lock)
+        tree.dec_lock_ref(leaf, full_only_lock.to_dec_params())
+        tree.sanity_check()
+
+    def test_prefetch_policy_uses_absolute_prefix_length(self):
+        tree, _, _, _, _ = self._build_inserted(2)
+        node = self._chain_from_root(tree)[-1]
         swa = tree.components[ComponentType.SWA]
+        matched_prefix_len = node.seqlen_start + len(node.key)
+        self.assertGreater(node.seqlen_start, 0)
 
         class FakeHostPool:
             def alloc(self, num_tokens):
                 return torch.arange(num_tokens, dtype=torch.int64)
 
         swa._swa_kv_pool_host = FakeHostPool()
-        matched_before_prefetch = node.seqlen_start + len(node.key)
-        prefetch_tokens = swa.swa_recompute_gate_threshold() - matched_before_prefetch
-        self.assertGreater(prefetch_tokens, 0)
-        self.assertLess(prefetch_tokens, swa.swa_recompute_gate_threshold())
+        gate = swa.swa_recompute_gate_threshold()
+        for final_prefix_len, expected_policy in (
+            (gate - self.cfg.page_size, PoolHitPolicy.TRAILING_PAGES),
+            (gate, PoolHitPolicy.OPTIONAL_TRAILING_PAGES),
+        ):
+            with self.subTest(final_prefix_len=final_prefix_len):
+                prefetch_tokens = final_prefix_len - matched_prefix_len
+                self.assertGreaterEqual(prefetch_tokens, self.cfg.page_size)
+                with envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.override(True):
+                    transfers = swa.build_hicache_transfers(
+                        node,
+                        CacheTransferPhase.PREFETCH,
+                        token_ids=list(range(prefetch_tokens)),
+                        prefetch_tokens=prefetch_tokens,
+                    )
 
-        with envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.override(True):
-            transfers = swa.build_hicache_transfers(
-                node,
-                CacheTransferPhase.PREFETCH,
-                token_ids=list(range(prefetch_tokens)),
-                prefetch_tokens=prefetch_tokens,
-            )
-
-        self.assertIsNotNone(transfers)
-        self.assertEqual(transfers[0].hit_policy, PoolHitPolicy.OPTIONAL_TRAILING_PAGES)
-
-    def test_chained_chunks_extend_checkpoint_chain(self):
-        """N=4096, two chained 8k chunks -> 4 checkpoint tails at k*N."""
-        tree, allocator, _ = build_fixture(self.cfg)
-        N = 4096
-        self._set_checkpoint_interval(tree, N)
-
-        self._insert_chunk(tree, allocator, base=0, num_tokens=_SWA_CP_CHUNK)
-        self._insert_chunk(
-            tree, allocator, base=_SWA_CP_CHUNK, num_tokens=_SWA_CP_CHUNK
-        )
-
-        _, _, _, ends = self._shape(tree)
-        for k in (1, 2, 3, 4):
-            self.assertIn(k * N, ends)
-        self.assertEqual(self._tail_count(tree), 4)
-        tree.sanity_check()
-
-    def test_split_node_preserves_seqlen_start(self):
-        """_split_node: new parent inherits seqlen_start, suffix bumps by split_len."""
-        tree, allocator, _ = build_fixture(self.cfg)
-        self._insert_chunk(tree, allocator, base=0, num_tokens=3 * _SWA_CP_PAGE_SIZE)
-        _, lengths, starts, _ = self._shape(tree)
-        self.assertEqual(lengths, [2 * _SWA_CP_PAGE_SIZE, _SWA_CP_W_TAIL])
-        self.assertEqual(starts, [0, 2 * _SWA_CP_PAGE_SIZE])
-        tree.sanity_check()
-
-    def test_chunk_boundary_inside_tail_window_admits_full_tail(self):
-        """Chunk boundary inside (k*N - W_tail, k*N): tail must split at both
-        ends and the gate must admit every sub-node in the window."""
-        page_size = 256
-        W_tail = 1024
-        chunk = 3840
-        N = 4096
-        cfg = CacheConfig(
-            page_size=page_size,
-            components=(ComponentType.FULL, ComponentType.SWA),
-            sliding_window_size=W_tail,
-            kv_size=4 * N,
-            max_num_reqs=4,
-            max_context_len=4 * N,
-            head_num=1,
-            head_dim=8,
-        )
-        tree, allocator, _ = build_fixture(cfg)
-        self._set_checkpoint_interval(tree, N)
-
-        def alloc(size):
-            aligned = ((size + page_size - 1) // page_size) * page_size
-            full = allocator.full_attn_allocator.alloc(aligned)
-            swa = allocator.swa_attn_allocator.alloc(aligned)
-            assert full is not None and swa is not None
-            allocator.full_to_swa_index_mapping[full] = swa
-            return full[:size]
-
-        def insert(num_tokens):
-            tokens = list(range(1, 1 + num_tokens))
-            tree.insert(
-                InsertParams(
-                    key=RadixKey(array("q", tokens)),
-                    value=alloc(num_tokens),
-                    swa_evicted_seqlen=0,
-                )
-            )
-
-        insert(chunk)
-        insert(2 * chunk)
-
-        _, _, _, ends = self._shape(tree)
-        self.assertIn(N - W_tail, ends)
-        self.assertIn(N, ends)
-
-        swa = tree.components[ComponentType.SWA]
-        chain, _, starts, ends_full = self._shape(tree)
-        admitted_lens = [
-            end - start
-            for n, start, end in zip(chain, starts, ends_full)
-            if start >= N - W_tail and end <= N
-        ]
-        self.assertGreater(len(admitted_lens), 0)
-        self.assertEqual(sum(admitted_lens), W_tail)
-        for n, start, end in zip(chain, starts, ends_full):
-            if start >= N - W_tail and end <= N:
-                self.assertTrue(
-                    swa._is_checkpoint_tail_node(n),
-                    f"node [{start}..{end}] inside tail window not admitted",
-                )
-        tree.sanity_check()
+                self.assertIsNotNone(transfers)
+                self.assertEqual(transfers[0].hit_policy, expected_policy)
 
 
 if __name__ == "__main__":
