@@ -180,18 +180,25 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         scheduler.disagg_decode_prealloc_queue.enqueue_held_rebootstrap.assert_called_once_with()
         self.assertFalse(scheduler._engine_paused)
 
-    def test_abort_drains_overlap_queue(self):
-        """abort with overlap enabled should drain the result_queue."""
+    def test_abort_drains_overlap_queue_after_war_barrier(self):
+        """abort must fence the in-flight forward before processing its result."""
         scheduler = self._new_scheduler()
         scheduler.enable_overlap = True
         mock_batch = MagicMock()
         mock_batch.forward_mode.is_extend.return_value = False
         scheduler.last_batch = mock_batch
         scheduler.result_queue = deque([(MagicMock(), MagicMock())])
-        scheduler.process_batch_result = MagicMock()
+        call_order = []
+        scheduler._apply_war_barrier = MagicMock(
+            side_effect=lambda: call_order.append("barrier")
+        )
+        scheduler.process_batch_result = MagicMock(
+            side_effect=lambda *_: call_order.append("process")
+        )
 
         scheduler.pause_generation(PauseGenerationReqInput(mode="abort"))
 
+        self.assertEqual(call_order, ["barrier", "process"])
         scheduler.process_batch_result.assert_called_once()
         self.assertEqual(len(scheduler.result_queue), 0)
 

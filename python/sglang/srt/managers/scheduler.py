@@ -4107,7 +4107,9 @@ class Scheduler(
             return
 
         if self.enable_overlap and self.last_batch:
-            # Process the results of the last batch
+            # Fence the in-flight forward before result processing publishes or
+            # releases cache state owned by that batch.
+            self._apply_war_barrier()
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
 
