@@ -28,6 +28,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertResult,
     MatchPrefixParams,
     MatchResult,
+    PendingCacheUpdate,
 )
 from sglang.srt.mem_cache.events import KVCacheEventMixin
 from sglang.srt.mem_cache.hicache_storage import (
@@ -40,6 +41,10 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.swa_recompute import (
+    SWARecomputeBatchState,
+    resolve_swa_recompute_prefix,
+)
 from sglang.srt.mem_cache.unified_cache_components import (
     _NUM_COMPONENT_TYPES,
     BASE_COMPONENT_TYPE,
@@ -67,7 +72,7 @@ from sglang.srt.observability.metrics_collector import (
 from sglang.srt.session.streaming_session import StreamingSession
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
         PrefetchOperation,
@@ -585,6 +590,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def register_sidecar_pool(self, spec: SidecarPoolSpec) -> None:
         self.sidecar_pool_specs.append(spec)
 
+    def create_pending_cache_update(
+        self, batch: ScheduleBatch
+    ) -> Optional[PendingCacheUpdate]:
+        return SWARecomputeBatchState.create_if_needed(batch)
+
+    def resolve_extra_compute_prefix(self, req: Req) -> tuple[int, bool]:
+        return resolve_swa_recompute_prefix(req, self)
+
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         result = self.session.try_match_prefix(params)
         if result is not None:
@@ -618,7 +631,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     best_match_node,
                     best_match_device_node,
                     best_match_device_value_len,
-                    swa_recompute_len=swa_recompute_len,
+                    extra_compute_prefix_len=swa_recompute_len,
                 )
 
             (
@@ -736,27 +749,31 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         return False
 
     def inc_lock_ref(self, node: Any) -> IncLockRefResult:
-        return self._inc_lock_ref_impl(
-            node, skip_swa=self._should_skip_swa_for_recompute(node)
+        skipped_components = (
+            {ComponentType.SWA} if self._should_skip_swa_for_recompute(node) else set()
         )
+        return self._inc_lock_ref_impl(node, skipped_components=skipped_components)
 
-    def inc_lock_ref_for_swa_recompute(self, node: Any) -> IncLockRefResult:
-        """Acquire the FULL part of a recompute prefix lock.
+    def inc_lock_ref_excluding_components(
+        self, node: Any, skipped_components: set[ComponentType]
+    ) -> IncLockRefResult:
+        """Acquire a composite lock while excluding selected components."""
+        return self._inc_lock_ref_impl(node, skipped_components=set(skipped_components))
 
-        The SWA part is acquired after the recompute forward commits fresh SWA
-        pages into the radix tree.
-        """
-        return self._inc_lock_ref_impl(node, skip_swa=True)
-
-    def _inc_lock_ref_impl(self, node: Any, skip_swa: bool = False) -> IncLockRefResult:
-        result = None if skip_swa else self.session.try_inc_lock_ref(node)
+    def _inc_lock_ref_impl(
+        self,
+        node: Any,
+        skipped_components: Optional[set[ComponentType]] = None,
+    ) -> IncLockRefResult:
+        skipped_components = skipped_components or set()
+        result = None if skipped_components else self.session.try_inc_lock_ref(node)
         if result is not None:
             return result
         if self.disable:
             return IncLockRefResult()
-        result = IncLockRefResult(swa_skipped=skip_swa)
+        result = IncLockRefResult(skipped_components=set(skipped_components))
         for component in self._components_tuple:
-            if skip_swa and component.component_type == ComponentType.SWA:
+            if component.component_type in skipped_components:
                 continue
             result = component.acquire_component_lock(node=node, result=result)
 
@@ -790,7 +807,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return result
         if self.disable:
             return DecLockRefResult()
-        skip_swa = skip_swa or (params is not None and params.swa_skipped)
+        skip_swa = skip_swa or (
+            params is not None and ComponentType.SWA in params.skipped_components
+        )
         for component in self._components_tuple:
             if skip_swa and component.component_type == ComponentType.SWA:
                 continue
@@ -826,7 +845,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.disable:
             return IncLockRefResult()
         skip_swa = self._should_skip_swa_for_recompute(node)
-        result = IncLockRefResult(swa_skipped=skip_swa)
+        result = IncLockRefResult(
+            skipped_components={ComponentType.SWA} if skip_swa else set()
+        )
         for component in self._components_tuple:
             if skip_swa and component.component_type == ComponentType.SWA:
                 continue
@@ -842,7 +863,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     ) -> DecLockRefResult:
         if self.disable:
             return DecLockRefResult()
-        skip_swa = params is not None and params.swa_skipped
+        skip_swa = params is not None and ComponentType.SWA in params.skipped_components
         for component in self._components_tuple:
             if skip_swa and component.component_type == ComponentType.SWA:
                 continue
@@ -917,8 +938,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.dec_lock_ref(
             req.last_node,
             DecLockRefParams(
-                swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None),
-                swa_skipped=getattr(req, "swa_prefix_lock_released", False),
+                swa_uuid_for_lock=req.swa_uuid_for_lock,
+                skipped_components=(
+                    {ComponentType.SWA} if req.swa_prefix_lock_released else set()
+                ),
             ),
         )
         req.swa_prefix_lock_released = False
@@ -1010,8 +1033,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.dec_lock_ref(
             req.last_node,
             DecLockRefParams(
-                swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None),
-                swa_skipped=getattr(req, "swa_prefix_lock_released", False),
+                swa_uuid_for_lock=req.swa_uuid_for_lock,
+                skipped_components=(
+                    {ComponentType.SWA} if req.swa_prefix_lock_released else set()
+                ),
             ),
         )
         if chunked and self._should_skip_swa_for_recompute(new_last_node):
@@ -1021,7 +1046,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 "The previous chunk's SWA tail must stay protected while the "
                 f"request continues chunked prefill, rid={req.rid}, "
                 f"matched_prefix_len={len(new_indices)}, "
-                f"match_swa_recompute_len={match_result.swa_recompute_len}"
+                "match_extra_compute_prefix_len="
+                f"{match_result.extra_compute_prefix_len}"
             )
         lock_result = self.inc_lock_ref(new_last_node)
 
@@ -1035,8 +1061,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         req.cache_protected_len = len(new_indices)
         req.last_node = new_last_node
         req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
-        req.swa_prefix_lock_released = lock_result.swa_skipped
-        req.swa_recompute_len = 0
+        req.swa_prefix_lock_released = (
+            ComponentType.SWA in lock_result.skipped_components
+        )
+        req.extra_compute_prefix_len = 0
 
         # cleanup
         for comp in self._components_tuple:
@@ -1211,7 +1239,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         best_match_node: UnifiedTreeNode,
         best_match_device_node: UnifiedTreeNode,
         best_match_device_value_len: int,
-        swa_recompute_len: int = 0,
+        extra_compute_prefix_len: int = 0,
     ) -> MatchResult:
         node_update = best_match_node
         for comp in self._components_tuple:
@@ -1245,13 +1273,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             last_host_node=last_host_node,
             best_match_node=best_match_node,
             host_hit_length=0,
-            swa_recompute_len=swa_recompute_len,
+            extra_compute_prefix_len=extra_compute_prefix_len,
         )
 
         for component in self._components_tuple:
             # Recompute rewrites the trailing SWA window; skip SWA load-back
             # bookkeeping for this match.
-            if swa_recompute_len > 0 and component.component_type == ComponentType.SWA:
+            if (
+                extra_compute_prefix_len > 0
+                and component.component_type == ComponentType.SWA
+            ):
                 continue
             result = component.finalize_match_result(
                 result=result,

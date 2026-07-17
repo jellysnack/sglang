@@ -452,7 +452,6 @@ class Scheduler(
         self.is_hybrid_swa = result.is_hybrid_swa
         self.is_hybrid_ssm = result.is_hybrid_ssm
         self.sliding_window_size = result.sliding_window_size
-        self.swa_recompute_config = result.swa_recompute_config
         self.full_tokens_per_layer = result.full_tokens_per_layer
         self.swa_tokens_per_layer = result.swa_tokens_per_layer
         self.req_to_token_pool = result.req_to_token_pool
@@ -498,10 +497,6 @@ class Scheduler(
 
         # Init chunked prefill
         self.init_chunked_prefill()
-
-        # Fail fast at startup if --chunked-prefill-size cannot fit the SWA
-        # recompute window + at least one page of tail.
-        self._assert_swa_recompute_chunk_size_compatible()
 
         # Init diffusion LLM
         self.init_diffusion_llm()
@@ -1029,31 +1024,6 @@ class Scheduler(
             metrics_collector=self.metrics_collector,
         )
 
-    def _assert_swa_recompute_chunk_size_compatible(self):
-        """Ensure chunked prefill can fit one recompute window plus tail page."""
-        if not envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.get():
-            return
-        if is_hip():
-            raise ValueError(
-                "SGLANG_OPT_SWA_RECOMPUTE_WINDOW=1 is not supported on the "
-                "DeepSeek V4 HIP radix attention backend yet."
-            )
-        assert self.swa_recompute_config is not None
-        if self.chunked_prefill_size is None:
-            return
-        w_r = self.swa_recompute_config.window_size
-        required = w_r + self.page_size
-        if self.chunked_prefill_size < required:
-            raise ValueError(
-                "SGLANG_OPT_SWA_RECOMPUTE_WINDOW=1 requires "
-                f"--chunked-prefill-size >= W_r + page_size = {required} "
-                f"for this model (W_r = page-aligned recompute window = {w_r}, "
-                f"page_size = {self.page_size}). Got "
-                f"--chunked-prefill-size={self.chunked_prefill_size}. "
-                "Either raise the chunked prefill size or disable the "
-                "SWA-window recompute feature."
-            )
-
     def init_schedule_policy(self):
         # Init schedule policy and new token estimation
         self.policy = SchedulePolicy(
@@ -1517,7 +1487,7 @@ class Scheduler(
             runner.war_fastpath_read_done_event = None
         else:
             self.schedule_stream.wait_stream(self.forward_stream)
-        self._commit_swa_recompute_for_queued_batch()
+        self._commit_queued_cache_updates()
 
     @DynamicGradMode()
     def event_loop_normal(self):
@@ -1662,19 +1632,18 @@ class Scheduler(
 
         return disable_overlap_for_batch or need_grammar_sync
 
-    def _commit_swa_recompute_for_queued_batch(self) -> None:
-        """Commit SWA recompute metadata before scheduling the next batch.
+    def _commit_queued_cache_updates(self) -> None:
+        """Publish cache updates before scheduling against the cache again.
 
         Overlap mode delays full result processing by one iteration, but the
-        next scheduling pass may stash the previous chunk and re-match against
-        the prefix cache. Once the WAR barrier has confirmed the forward writes
-        are done, the SWA full->SWA mapping must be visible before that re-match.
+        next scheduling pass may re-match against the prefix cache. Once the WAR
+        barrier confirms the writes are done, transactional cache metadata must
+        be visible before that re-match.
         """
-        result_queue = getattr(self, "result_queue", None)
-        if not result_queue:
+        if not self.result_queue:
             return
-        batch, _ = result_queue[0]
-        batch.commit_swa_recompute()
+        batch, _ = self.result_queue[0]
+        batch.commit_pending_cache_updates()
 
     @scheduler_nvtx_method("scheduler.process_input_requests")
     def process_input_requests(self, recv_reqs: List):
@@ -3021,14 +2990,6 @@ class Scheduler(
 
         set_time_batch(can_run_list, "set_forward_entry_time")
 
-        swa_recompute_lens: Optional[List[int]] = None
-        if (
-            envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.get()
-            and self.swa_recompute_config is not None
-            and any(req.swa_recompute_len > 0 for req in can_run_list)
-        ):
-            swa_recompute_lens = [max(0, req.swa_recompute_len) for req in can_run_list]
-
         # Create a new batch
         new_batch = ScheduleBatch.init_new(
             can_run_list,
@@ -3052,7 +3013,7 @@ class Scheduler(
                 self.tree_cache.ready_to_load_host_cache()
             )
 
-        new_batch.prepare_for_extend(swa_recompute_lens=swa_recompute_lens)
+        new_batch.prepare_for_extend()
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:
@@ -3079,10 +3040,9 @@ class Scheduler(
             and not (new_batch.return_logprob or running_batch.return_logprob)
             # mix_with_running cats input_ids but not input_embeds — shapes would mismatch
             and new_batch.input_embeds is None
-            # SWA recompute rewrites matched-prefix KV slots. Keep it out of a
-            # mixed prefill+decode batch so decode cannot read those slots while
-            # prefill is refreshing them.
-            and swa_recompute_lens is None
+            # Transactional cache updates may rewrite prefix dependencies; keep
+            # them isolated from decode readers until the forward commits.
+            and not new_batch.requires_isolated_forward
         ):
             # TODO (lianmin): support return_logprob + mixed chunked prefill
             running_batch.filter_batch()
@@ -3488,7 +3448,7 @@ class Scheduler(
         try:
             return self._run_batch(batch, pp_proxy_tensors=pp_proxy_tensors)
         except BaseException:
-            batch.abort_pending_swa_recompute()
+            batch.abort_pending_cache_updates()
             raise
 
     def _maybe_report_active_ranks(self) -> None:
@@ -3560,7 +3520,7 @@ class Scheduler(
         if batch.forward_mode.is_decode():
             self.batch_result_processor.process_batch_result_decode(batch, result)
         elif batch.forward_mode.is_extend():
-            batch.commit_swa_recompute()
+            batch.commit_pending_cache_updates()
             if batch.is_dllm():
                 self.process_batch_result_dllm(batch, result)
             elif self.disaggregation_mode == DisaggregationMode.PREFILL:

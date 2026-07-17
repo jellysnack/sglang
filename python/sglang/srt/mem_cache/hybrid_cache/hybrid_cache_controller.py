@@ -113,6 +113,7 @@ class StorageOperation(BaseStorageOperation):
         super().__init__(host_indices, token_ids, last_hash, hash_value, prefix_keys)
         self.pool_transfers = pool_transfers
         self.pool_storage_result = PoolTransferResult.empty()
+        self.pool_storage_query_hit_pages: dict[str, int] = {}
 
 
 class PrefetchOperation(StorageOperation):
@@ -654,7 +655,7 @@ class HybridCacheController(BaseHiCacheController):
             self._resolve_sidecar_derived_pool_transfers(operation)
             read_transfers = self._filter_prefetch_pool_transfers(
                 operation.pool_transfers,
-                getattr(operation, "pool_storage_query_hit_pages", {}),
+                operation.pool_storage_query_hit_pages,
                 kv_completed_pages,
             )
             results = (

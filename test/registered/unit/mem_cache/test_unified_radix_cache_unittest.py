@@ -32,10 +32,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.cache_init_params import (
-    CacheInitParams,
-    SWARecomputeConfig,
-)
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import available_and_evictable_str
 from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName
 from sglang.srt.mem_cache.memory_pool import (
@@ -46,6 +43,7 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.mem_cache.swa_recompute import SWARecomputeConfig
 from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     CacheTransferPhase,
     ComponentType,
@@ -4329,7 +4327,7 @@ class TestUnifiedSWARecompute(UnifiedRadixCacheTestMixin, CustomTestCase):
                         MatchPrefixParams(key=RadixKey(array("q", seq)))
                     )
 
-                self.assertEqual(result.swa_recompute_len, 0)
+                self.assertEqual(result.extra_compute_prefix_len, 0)
                 if state == "host_tail":
                     self.assertGreater(result.host_hit_length, 0)
                     self.assertGreater(result.swa_host_hit_length, 0)
@@ -4349,7 +4347,9 @@ class TestUnifiedSWARecompute(UnifiedRadixCacheTestMixin, CustomTestCase):
             result = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
 
         swa = tree.components[ComponentType.SWA]
-        self.assertEqual(result.swa_recompute_len, swa.swa_recompute_window_size())
+        self.assertEqual(
+            result.extra_compute_prefix_len, swa.swa_recompute_window_size()
+        )
         self.assertGreater(result.host_hit_length, 0)
         self.assertEqual(result.swa_host_hit_length, 0)
 
@@ -4368,7 +4368,7 @@ class TestUnifiedSWARecompute(UnifiedRadixCacheTestMixin, CustomTestCase):
             result = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
 
         self.assertEqual(walk_full_prefix.call_count, 1)
-        self.assertEqual(result.swa_recompute_len, 0)
+        self.assertEqual(result.extra_compute_prefix_len, 0)
         self.assertEqual(result.host_hit_length, 0)
         self.assertEqual(len(result.device_indices), 0)
 
@@ -4383,7 +4383,7 @@ class TestUnifiedSWARecompute(UnifiedRadixCacheTestMixin, CustomTestCase):
             swa.build_hicache_transfers(leaf, CacheTransferPhase.LOAD_BACK, req=None)
 
         req = self._make_req(req_to_token_pool)
-        req.swa_recompute_len = swa.swa_recompute_window_size()
+        req.extra_compute_prefix_len = swa.swa_recompute_window_size()
         self.assertIsNone(
             swa.build_hicache_transfers(leaf, CacheTransferPhase.LOAD_BACK, req=req)
         )
@@ -4407,10 +4407,12 @@ class TestUnifiedSWARecompute(UnifiedRadixCacheTestMixin, CustomTestCase):
         self.assertIsNotNone(fresh_swa)
         allocator.commit_fresh_swa_for_recompute_window(full_data.value, fresh_swa)
 
-        lock_result = tree.inc_lock_ref_for_swa_recompute(leaf)
+        lock_result = tree.inc_lock_ref_excluding_components(leaf, {ComponentType.SWA})
         req = self._make_req(req_to_token_pool)
         req.last_node = leaf
-        req.swa_prefix_lock_released = lock_result.swa_skipped
+        req.swa_prefix_lock_released = (
+            ComponentType.SWA in lock_result.skipped_components
+        )
         tree.complete_swa_recompute_lock(req, len(seq))
 
         self.assertGreater(full_data.lock_ref, 0)
@@ -4444,7 +4446,9 @@ class TestUnifiedSWARecompute(UnifiedRadixCacheTestMixin, CustomTestCase):
         self.assertEqual(swa_data.lock_ref, swa_lock_ref)
         self.assertLess(full_data.lock_ref, full_lock_ref)
 
-        full_only_lock = tree.inc_lock_ref_for_swa_recompute(leaf)
+        full_only_lock = tree.inc_lock_ref_excluding_components(
+            leaf, {ComponentType.SWA}
+        )
         tree.dec_swa_lock_only(leaf, lock_result.swa_uuid_for_lock)
         tree.dec_lock_ref(leaf, full_only_lock.to_dec_params())
         tree.sanity_check()

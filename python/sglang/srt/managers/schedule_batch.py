@@ -78,17 +78,16 @@ from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     EvictParams,
     MatchPrefixParams,
+    PendingCacheUpdate,
     zero_match_result,
 )
 from sglang.srt.mem_cache.common import (
     alloc_for_decode,
     alloc_for_extend,
-    alloc_for_extend_swa_recompute,
     evict_from_tree_cache,
     free_swa_out_of_window_slots,
     get_alloc_reserve_per_decode,
@@ -133,35 +132,6 @@ INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 MM_PAD_SHIFT_VALUE = 1_000_000
 
 logger = logging.getLogger(__name__)
-
-
-def _split_cached_tokens_by_source(
-    pre_len: int,
-    host_hit_length: int,
-    storage_hit_length: int,
-    swa_recompute_len: int,
-) -> Tuple[int, int, int]:
-    storage_total = min(host_hit_length, storage_hit_length)
-    host_only_total = host_hit_length - storage_total
-    recomputed_host = min(host_hit_length, max(0, swa_recompute_len))
-    # L3 hits are the suffix of the host-hit segment, so recompute consumes
-    # storage attribution before host-only attribution.
-    storage_recomputed = min(storage_total, recomputed_host)
-    storage_portion = storage_total - storage_recomputed
-    host_recomputed = recomputed_host - storage_recomputed
-    host_portion = host_only_total - min(host_only_total, host_recomputed)
-    host_cached_total = host_portion + storage_portion
-    device_portion = max(0, pre_len - host_cached_total)
-    return device_portion, host_portion, storage_portion
-
-
-def _swa_recompute_commit_len(
-    recompute_len: int, sliding_window_size: int, page_size: int
-) -> int:
-    if recompute_len <= 0:
-        return 0
-    tail_len = ((sliding_window_size + page_size - 1) // page_size) * page_size
-    return min(recompute_len, tail_len)
 
 
 @lru_cache(maxsize=1)
@@ -903,8 +873,8 @@ class Req(ReqDllmMixin):
         self.swa_prefix_lock_released: bool = False
         # The prefix length that is inserted into the tree cache
         self.cache_protected_len: int = 0
-        # Trailing matched tokens whose SWA KV must be recomputed.
-        self.swa_recompute_len: int = 0
+        # Trailing matched prefix tokens included in the physical forward.
+        self.extra_compute_prefix_len: int = 0
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
@@ -1290,7 +1260,7 @@ class Req(ReqDllmMixin):
             else:
                 self.cache_protected_len = len(self.prefix_indices)
 
-            self.swa_recompute_len = match_result.swa_recompute_len
+            self.extra_compute_prefix_len = match_result.extra_compute_prefix_len
 
             if self.is_dllm():
                 self._update_block_offset_for_dllm()
@@ -1537,7 +1507,7 @@ class Req(ReqDllmMixin):
         self.last_node = None
         self.cache_protected_len = 0
         self.num_matched_prefix_tokens = 0
-        self.swa_recompute_len = 0
+        self.extra_compute_prefix_len = 0
         self.swa_uuid_for_lock = None
         self.swa_prefix_lock_released = False
         self.extend_range = None
@@ -1662,20 +1632,6 @@ class Req(ReqDllmMixin):
         )
         logger.info(f"{prefix}: {self.time_stats.convert_to_duration()}")
         self.has_log_time_stats = True
-
-    def reset_swa_recompute_to_cold_prefill(self, root_node: Any) -> None:
-        """Drop a recompute prefix hit and schedule this request as cold prefill."""
-        self.prefix_indices = self.prefix_indices[:0]
-        self.last_node = root_node
-        self.last_host_node = root_node
-        self.best_match_node = root_node
-        self.host_hit_length = 0
-        self.swa_host_hit_length = 0
-        self.mamba_host_hit_length = 0
-        self.storage_hit_length = 0
-        self.num_matched_prefix_tokens = 0
-        self.cache_protected_len = 0
-        self.swa_recompute_len = 0
 
     def set_finish_with_abort(self, error_msg: str):
         if get_parallel().tp_rank == 0:
@@ -1831,14 +1787,6 @@ def _compute_chunked_req_next_prompt_token(
 
 
 @dataclasses.dataclass
-class SWARecomputeTxn:
-    req: Req
-    recompute_len: int
-    full_indices: torch.Tensor
-    fresh_swa_indices: torch.Tensor
-
-
-@dataclasses.dataclass
 class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     """Store all information of a batch on the scheduler."""
 
@@ -1927,7 +1875,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # DSV4-NPU: per-pool slot bundle from DSV4NPUTokenToKVPoolAllocator (None
     # elsewhere); c4/c128 state lens ride on ``batch.dsv4_state_lens``.
     out_cache_loc_dsv4: Optional[Any] = None
-    swa_out_cache_loc_override: Optional[torch.Tensor] = None
 
     # For hybrid GDN prefix cache
     mamba_track_indices: torch.Tensor = None  # shape: [b], int64
@@ -1966,9 +1913,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
 
-    # Per-req boundary P below which recompute suppresses compressed-KV writes.
-    swa_recompute_boundaries: Optional[List[int]] = None
-    swa_recompute_txns: Optional[List[SWARecomputeTxn]] = None
+    # Optional transactional cache update attached by a cache-specific policy.
+    pending_cache_update: Optional[PendingCacheUpdate] = None
 
     # Whether to return hidden states
     return_hidden_states: bool = False
@@ -2186,167 +2132,24 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
             req.logprob_start_len = max(req.logprob_start_len, encoder_len)
 
-    def _alloc_swa_recompute_windows(self, recompute_lens: List[int]) -> None:
-        allocator_sw = self.token_to_kv_pool_allocator
-        assert isinstance(
-            allocator_sw, SWATokenToKVPoolAllocator
-        ), "SWA-window recompute requires a SWATokenToKVPoolAllocator"
-
-        total_recompute_tokens = 0
-        for req, R in zip(self.reqs, recompute_lens):
-            if R <= 0:
-                continue
-            total_recompute_tokens += R
-
-        if total_recompute_tokens == 0:
-            return
-
-        # Recompute writes to private SWA pages first. Do all needed eviction
-        # before allocating those private pages; the global full->SWA mapping is
-        # committed only after forward finishes.
-        swa_avail_before_evict = allocator_sw.swa_attn_allocator.available_size()
-        if total_recompute_tokens > swa_avail_before_evict:
-            self.tree_cache.evict(
-                EvictParams(
-                    num_tokens=0,
-                    swa_num_tokens=total_recompute_tokens - swa_avail_before_evict,
-                )
-            )
-
-        swa_out_parts = []
-        txns: List[SWARecomputeTxn] = []
-        self.swa_recompute_txns = txns
-        try:
-            for req, R in zip(self.reqs, recompute_lens):
-                P = len(req.prefix_indices)
-                seq_len = req.extend_range.end
-                new_tokens = seq_len - P
-
-                if R > 0:
-                    assert req.swa_prefix_lock_released, (
-                        "SWA-window recompute requires a FULL-only request lock "
-                        f"before allocating private SWA pages, rid={req.rid}"
-                    )
-                    window_full = req.prefix_indices[P - R : P]
-                    fresh_swa = allocator_sw.alloc_fresh_swa_for_recompute_window(
-                        window_full
-                    )
-                    if fresh_swa is None:
-                        swa_avail_after_evict = (
-                            allocator_sw.swa_attn_allocator.available_size()
-                        )
-                        raise AssertionError(
-                            "SWA-window recompute: fresh SWA alloc failed despite "
-                            f"pre-check; R={R}, total_R={total_recompute_tokens}, "
-                            f"swa_avail_before_evict={swa_avail_before_evict}, "
-                            f"swa_avail_after_evict={swa_avail_after_evict}, "
-                            f"swa_evictable={self.tree_cache.swa_evictable_size()}, "
-                            f"page_size={allocator_sw.page_size}, rid={req.rid}"
-                        )
-                    txns.append(
-                        SWARecomputeTxn(
-                            req=req,
-                            recompute_len=R,
-                            full_indices=window_full,
-                            fresh_swa_indices=fresh_swa,
-                        )
-                    )
-                    swa_out_parts.append(fresh_swa)
-
-                if new_tokens > 0:
-                    assert req.req_pool_idx is not None
-                    tail_full = self.req_to_token_pool.req_to_token[
-                        req.req_pool_idx, P:seq_len
-                    ]
-                    swa_out_parts.append(
-                        allocator_sw.translate_loc_from_full_to_swa(tail_full)
-                    )
-
-            if not swa_out_parts:
-                self.swa_recompute_txns = None
-                return
-
-            self.swa_out_cache_loc_override = torch.cat(swa_out_parts).to(torch.int32)
-            assert len(self.swa_out_cache_loc_override) == self.extend_num_tokens, (
-                f"{len(self.swa_out_cache_loc_override)=}, "
-                f"{self.extend_num_tokens=}"
-            )
-        except Exception:
-            self.abort_pending_swa_recompute()
-            raise
-
-    def commit_swa_recompute(self) -> None:
-        txns = self.swa_recompute_txns
-        if not txns:
-            return
-
-        allocator_sw = self.token_to_kv_pool_allocator
-        assert isinstance(
-            allocator_sw, SWATokenToKVPoolAllocator
-        ), "SWA-window recompute requires a SWATokenToKVPoolAllocator"
-        complete_lock = getattr(self.tree_cache, "complete_swa_recompute_lock", None)
-        assert complete_lock is not None, (
-            "SWA-window recompute requires a prefix cache with "
-            "complete_swa_recompute_lock"
+    @property
+    def requires_isolated_forward(self) -> bool:
+        return (
+            self.pending_cache_update is not None
+            and self.pending_cache_update.is_pending
         )
 
-        sliding_window_size = self.tree_cache.sliding_window_size
-        assert (
-            sliding_window_size is not None and sliding_window_size > 0
-        ), "SWA-window recompute requires a positive sliding_window_size"
+    def commit_pending_cache_updates(self) -> None:
+        update = self.pending_cache_update
+        if update is not None and update.is_pending:
+            update.commit(self)
 
-        commit_lens: List[int] = []
-        for txn in txns:
-            commit_len = _swa_recompute_commit_len(
-                txn.recompute_len, sliding_window_size, allocator_sw.page_size
-            )
-            commit_lens.append(commit_len)
+    def abort_pending_cache_updates(self) -> None:
+        update = self.pending_cache_update
+        if update is not None and update.is_pending:
+            update.abort(self)
 
-            # The whole R window is a private forward workspace, but only the
-            # regular SWA tail is reusable cache state after recompute.
-            stale_len = txn.recompute_len - commit_len
-            if stale_len > 0:
-                allocator_sw.free_fresh_swa(txn.fresh_swa_indices[:stale_len])
-            if commit_len > 0:
-                allocator_sw.commit_fresh_swa_for_recompute_window(
-                    txn.full_indices[-commit_len:],
-                    txn.fresh_swa_indices[-commit_len:],
-                )
-
-        for txn, commit_len in zip(txns, commit_lens):
-            req = txn.req
-            P = len(req.prefix_indices)
-            if commit_len > 0:
-                complete_lock(req, commit_len)
-                req.swa_evicted_seqlen = min(req.swa_evicted_seqlen, P - commit_len)
-            # Consumed; downstream should treat this as an ordinary hit at P.
-            req.swa_recompute_len = 0
-
-        txns.clear()
-        self.swa_recompute_txns = None
-        self.swa_out_cache_loc_override = None
-
-    def abort_pending_swa_recompute(self) -> None:
-        """Release private SWA pages if this batch has an uncommitted recompute."""
-        txns = self.swa_recompute_txns
-        if not txns:
-            self.swa_recompute_txns = None
-            self.swa_out_cache_loc_override = None
-            return
-
-        allocator_sw = self.token_to_kv_pool_allocator
-        assert isinstance(
-            allocator_sw, SWATokenToKVPoolAllocator
-        ), "SWA-window recompute requires a SWATokenToKVPoolAllocator"
-
-        for txn in txns:
-            allocator_sw.free_fresh_swa(txn.fresh_swa_indices)
-
-        txns.clear()
-        self.swa_recompute_txns = None
-        self.swa_out_cache_loc_override = None
-
-    def prepare_for_extend(self, swa_recompute_lens: Optional[List[int]] = None):
+    def prepare_for_extend(self):
         """Build an EXTEND batch."""
         self.forward_mode = ForwardMode.EXTEND
         server_args = get_server_args()
@@ -2357,61 +2160,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Init tensors
         reqs = self.reqs
-        is_swa_recompute = swa_recompute_lens is not None and any(
-            r > 0 for r in swa_recompute_lens
-        )
-        self.swa_recompute_txns = None
-        self.swa_out_cache_loc_override = None
+        self.pending_cache_update = self.tree_cache.create_pending_cache_update(self)
         logical_prefix_lens = [len(r.prefix_indices) for r in reqs]
-        if is_swa_recompute:
-            assert isinstance(
-                self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
-            ), "SWA-window recompute requires a SWATokenToKVPoolAllocator"
-            assert (
-                not self.model_config.is_encoder_decoder
-            ), "SWA-window recompute does not support encoder-decoder models"
-            assert len(swa_recompute_lens) == len(reqs)
-            recompute_lens = list(swa_recompute_lens)
-            input_ids = [
-                r.get_fill_ids()[logical_prefix_lens[i] - recompute_lens[i] :]
-                for i, r in enumerate(reqs)
-            ]
-            prefix_lens = [
-                logical_prefix_lens[i] - recompute_lens[i] for i, r in enumerate(reqs)
-            ]
-            self.swa_recompute_boundaries = logical_prefix_lens
-            for i, req in enumerate(reqs):
-                R = recompute_lens[i]
-                if R <= 0:
-                    continue
-                assert (
-                    req.input_embeds is None
-                ), "SWA-window recompute does not support input_embeds"
-                assert (
-                    req.positional_embed_overrides is None
-                ), "SWA-window recompute does not support positional embed overrides"
-                extend_logprob_start_len = compute_extend_logprob_start_len(
-                    logprob_start_len=req.logprob_start_len,
-                    prefix_len=logical_prefix_lens[i],
-                    extend_len=req.extend_range.length,
-                    full_untruncated_fill_len=len(req.full_untruncated_fill_ids),
-                )
-                wants_input_logprobs = (
-                    req.return_logprob
-                    and extend_logprob_start_len < req.extend_range.length
-                )
-                assert not wants_input_logprobs, (
-                    "SWA-window recompute supports OUTPUT logprobs only; "
-                    "use logprob_start_len = -1 (or prompt len) to score the "
-                    "first generated token."
-                )
+        if self.pending_cache_update is not None:
+            input_ids, prefix_lens = self.pending_cache_update.prepare_inputs(reqs)
         else:
-            recompute_lens = None
             input_ids = [
                 r.get_fill_ids()[logical_prefix_lens[i] :] for i, r in enumerate(reqs)
             ]
             prefix_lens = logical_prefix_lens
-            self.swa_recompute_boundaries = None
         extend_num_tokens = sum(len(ids) for ids in input_ids)
         seq_lens = [r.extend_range.end for r in reqs]
         orig_seq_lens = [max(r.extend_range.end, len(r.origin_input_ids)) for r in reqs]
@@ -2425,6 +2182,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
             for i, r in enumerate(reqs)
         ]
+        if self.pending_cache_update is not None:
+            for i, req in enumerate(reqs):
+                if self.pending_cache_update.extra_compute_lens[i] <= 0:
+                    continue
+                wants_input_logprobs = (
+                    req.return_logprob
+                    and extend_logprob_start_lens[i] < req.extend_range.length
+                )
+                self.pending_cache_update.validate_request(req, wants_input_logprobs)
 
         _pin = is_pin_memory_available(self.device)
         # Stay on pinned CPU; H2D is deferred to forward stream via
@@ -2446,11 +2212,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_num_tokens = extend_num_tokens
 
         # Allocate memory
-        if is_swa_recompute:
+        if self.pending_cache_update is not None:
             out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = (
-                alloc_for_extend_swa_recompute(self, recompute_lens)
+                self.pending_cache_update.allocate(self)
             )
-            self._alloc_swa_recompute_windows(recompute_lens)
         else:
             out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = (
                 alloc_for_extend(self)
@@ -2470,11 +2235,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mamba_track_seqlens_cpu = []
 
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
-            # For SWA-window recompute the merged extend is longer than the
-            # logical extend by R (the recomputed window); the req's own
-            # extend_range still counts only the new tail.
-            R_i = recompute_lens[i] if recompute_lens is not None else 0
-            assert seq_len - pre_len == req.extend_range.length + R_i
+            extra_compute_len = (
+                self.pending_cache_update.extra_compute_lens[i]
+                if self.pending_cache_update is not None
+                else 0
+            )
+            assert seq_len - pre_len == req.extend_range.length + extra_compute_len
 
             req.extend_batch_idx += 1
 
@@ -2530,19 +2296,25 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     # - storage_hit_length = tokens loaded from storage backend (L3 hits)
                     # - device_portion = pre_len - host_hit_length
                     #
-                    # For SWA recompute, pre_len excludes the recomputed suffix;
-                    # subtract any host/storage overlap with that suffix before
-                    # breaking down cached tokens.
                     # Storage hits are now tracked via scheduler after prefetch completes.
                     # storage_hit_length is set by scheduler.pop_prefetch_loaded_tokens()
-                    device_portion, host_portion, storage_portion = (
-                        _split_cached_tokens_by_source(
-                            pre_len=pre_len,
-                            host_hit_length=req.host_hit_length,
-                            storage_hit_length=req.storage_hit_length,
-                            swa_recompute_len=req.swa_recompute_len,
+                    if self.pending_cache_update is not None:
+                        device_portion, host_portion, storage_portion = (
+                            self.pending_cache_update.split_cached_tokens_by_source(
+                                i,
+                                pre_len=pre_len,
+                                host_hit_length=req.host_hit_length,
+                                storage_hit_length=req.storage_hit_length,
+                            )
                         )
-                    )
+                    else:
+                        storage_portion = min(
+                            req.host_hit_length, req.storage_hit_length
+                        )
+                        host_portion = req.host_hit_length - storage_portion
+                        device_portion = max(
+                            0, pre_len - host_portion - storage_portion
+                        )
 
                     req.cached_tokens_device = device_portion
                     req.cached_tokens_host = host_portion
@@ -2654,13 +2426,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.top_logprobs_nums = [r.logprob.top_logprobs_num for r in reqs]
             self.token_ids_logprobs = [r.logprob.token_ids_logprob for r in reqs]
 
-        # extend_logprob_start_len is relative to the logical prefix P. For
-        # SWA-window recompute reqs the merged extend prepends R cached tokens,
-        # so shift the per-req start by R to stay consistent with the batch-
-        # level extend_lens (else num_tokens_for_logprob == batch_size breaks).
-        if is_swa_recompute:
+        # Extra prefix compute prepends cached tokens to the physical extend,
+        # so keep logprob offsets aligned with the physical batch tensor.
+        if self.pending_cache_update is not None:
             self.extend_logprob_start_lens = [
-                extend_logprob_start_lens[i] + recompute_lens[i]
+                extend_logprob_start_lens[i]
+                + self.pending_cache_update.extra_compute_lens[i]
                 for i in range(len(reqs))
             ]
         else:
@@ -3306,8 +3077,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             model_config=self.model_config,
             forward_mode=self.forward_mode,
             out_cache_loc=self.out_cache_loc,
-            swa_out_cache_loc_override=self.swa_out_cache_loc_override,
-            swa_recompute_txns=self.swa_recompute_txns,
+            pending_cache_update=self.pending_cache_update,
             return_logprob=self.return_logprob,
             decoding_reqs=self.decoding_reqs,
             spec_algorithm=self.spec_algorithm,

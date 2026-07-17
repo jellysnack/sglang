@@ -606,7 +606,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
-        if forward_batch.swa_recompute_boundaries is not None:
+        if not forward_batch.allow_prefill_cuda_graph:
             return False
         if self._is_full_backend and forward_batch.batch_size > self._capture_req_slots:
             return False

@@ -10,6 +10,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefResult,
     IncLockRefResult,
 )
+from sglang.srt.mem_cache.swa_recompute import resolve_swa_recompute_prefix
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils.common import Range
 from sglang.test.ci.ci_register import (
@@ -44,12 +45,17 @@ class TestPrefillAdder(CustomTestCase):
         tree_cache.evictable_size.return_value = evictable_size
         tree_cache.disable = False
         tree_cache.inc_lock_ref.return_value = IncLockRefResult()
-        tree_cache.inc_lock_ref_for_swa_recompute.return_value = IncLockRefResult(
-            swa_skipped=True
+        tree_cache.inc_lock_ref_excluding_components.side_effect = (
+            lambda _node, skipped_components: IncLockRefResult(
+                skipped_components=set(skipped_components)
+            )
         )
         tree_cache.dec_lock_ref.return_value = DecLockRefResult()
         tree_cache.is_tree_cache.return_value = False
         tree_cache.supports_mamba.return_value = False
+        tree_cache.resolve_extra_compute_prefix.side_effect = (
+            lambda req: resolve_swa_recompute_prefix(req, tree_cache)
+        )
         return tree_cache
 
     def create_token_allocator(
@@ -91,7 +97,7 @@ class TestPrefillAdder(CustomTestCase):
         req.sampling_params = SimpleNamespace(max_new_tokens=max_new_tokens)
         req.time_stats = SimpleNamespace(wait_queue_entry_time=wait_time)
         req.retracted_stain = False
-        req.swa_recompute_len = 0
+        req.extra_compute_prefix_len = 0
         req.finished.return_value = False
         req.needs_host_load_back.return_value = False
         return req
@@ -548,7 +554,9 @@ class TestPrefillAdder(CustomTestCase):
                     rem_chunk_tokens=rem_chunk,
                 )
                 self.assertEqual(
-                    adder._swa_budget_for_req(extend, recompute_len=recompute),
+                    adder._swa_budget_for_req(
+                        extend, extra_compute_prefix_len=recompute
+                    ),
                     expected,
                 )
 
@@ -573,7 +581,7 @@ class TestPrefillAdder(CustomTestCase):
         )
         req.last_node = MagicMock()
         req.sampling_params.ignore_eos = False
-        req.swa_recompute_len = swa_recompute_len
+        req.extra_compute_prefix_len = swa_recompute_len
         return req
 
     def _make_tensor_prefill_req(
@@ -604,22 +612,6 @@ class TestPrefillAdder(CustomTestCase):
         req.last_host_node = MagicMock(name=f"{rid}_last_host_node")
         req.best_match_node = MagicMock(name=f"{rid}_best_match_node")
 
-        def reset_swa_recompute_to_cold_prefill(root_node):
-            req.prefix_indices = req.prefix_indices[:0]
-            req.last_node = root_node
-            req.last_host_node = root_node
-            req.best_match_node = root_node
-            req.host_hit_length = 0
-            req.swa_host_hit_length = 0
-            req.mamba_host_hit_length = 0
-            req.storage_hit_length = 0
-            req.num_matched_prefix_tokens = 0
-            req.cache_protected_len = 0
-            req.swa_recompute_len = 0
-
-        req.reset_swa_recompute_to_cold_prefill.side_effect = (
-            reset_swa_recompute_to_cold_prefill
-        )
         req.needs_host_load_back.return_value = host_hit_length > 0
         return req
 
@@ -648,7 +640,7 @@ class TestPrefillAdder(CustomTestCase):
         )
 
         self.assertEqual(result, AddReqResult.CONTINUE)
-        self.assertEqual(req.swa_recompute_len, 0)
+        self.assertEqual(req.extra_compute_prefix_len, 0)
         self.assertEqual(len(req.prefix_indices), 0)
         self.assertEqual(req.extend_range, Range(0, len(req.full_untruncated_fill_ids)))
         self.assertEqual(req.last_node, self.mock_tree_cache.root_node)
@@ -681,7 +673,7 @@ class TestPrefillAdder(CustomTestCase):
         )
 
         self.assertEqual(result, AddReqResult.CONTINUE)
-        self.assertEqual(req.swa_recompute_len, 96)
+        self.assertEqual(req.extra_compute_prefix_len, 96)
         self.assertEqual(req.extend_range, Range(512 + host_hit, 512 + host_hit + 64))
         self.assertEqual(len(req.prefix_indices), 512 + host_hit)
         self.assertEqual(adder.can_run_list, [req])

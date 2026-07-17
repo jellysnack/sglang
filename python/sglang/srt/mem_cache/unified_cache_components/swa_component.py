@@ -749,7 +749,7 @@ class SWAComponent(TreeComponent):
             ]
 
         if phase == CacheTransferPhase.LOAD_BACK:
-            if req is not None and max(0, int(req.swa_recompute_len)) > 0:
+            if req is not None and max(0, int(req.extra_compute_prefix_len)) > 0:
                 # The recompute forward rewrites the full trailing SWA window
                 # into fresh pages, so host SWA load-back would be redundant.
                 return None

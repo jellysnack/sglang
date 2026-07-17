@@ -13,7 +13,6 @@ class KVCacheBuildResult:
     is_hybrid_swa: bool
     is_hybrid_ssm: bool
     sliding_window_size: Optional[int]
-    swa_recompute_config: Optional[SWARecomputeConfig]
     full_tokens_per_layer: Optional[int]
     swa_tokens_per_layer: Optional[int]
     req_to_token_pool: object
@@ -34,11 +33,9 @@ from sglang.srt.configs.hybrid_arch import (
 from sglang.srt.configs.model_config import ModelImpl, is_deepseek_dsa
 from sglang.srt.environ import envs
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
-from sglang.srt.mem_cache.cache_init_params import (
-    CacheInitParams,
-    SWARecomputeConfig,
-)
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
+from sglang.srt.mem_cache.swa_recompute import SWARecomputeConfig
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.runtime_context import get_parallel
 
@@ -177,12 +174,13 @@ def build_kv_cache(
         full_tokens_per_layer, swa_tokens_per_layer = (
             tp_worker.get_tokens_per_layer_info()
         )
-        swa_recompute_config = SWARecomputeConfig.from_dimensions(
-            sliding_window_size=sliding_window_size,
-            num_swa_layers=model_config.num_hidden_layers,
-            page_size=page_size,
-            gate_multiplier=envs.SGLANG_SWA_RECOMPUTE_GATE_MULTIPLIER.get(),
-        )
+        if envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.get():
+            swa_recompute_config = SWARecomputeConfig.from_dimensions(
+                sliding_window_size=sliding_window_size,
+                num_swa_layers=model_config.num_hidden_layers,
+                page_size=page_size,
+                gate_multiplier=envs.SGLANG_SWA_RECOMPUTE_GATE_MULTIPLIER.get(),
+            )
 
     req_to_token_pool, token_to_kv_pool_allocator = tp_worker.get_memory_pool()
 
@@ -216,6 +214,10 @@ def build_kv_cache(
     effective_chunked_prefill_size = server_args.chunked_prefill_size
     if model_config.is_multimodal and uses_transformers_backend:
         effective_chunked_prefill_size = None
+    if swa_recompute_config is not None:
+        swa_recompute_config.validate_chunked_prefill_size(
+            effective_chunked_prefill_size, page_size
+        )
 
     params = CacheInitParams(
         disable=disable_radix_cache,
@@ -288,7 +290,6 @@ def build_kv_cache(
         is_hybrid_swa=is_hybrid_swa,
         is_hybrid_ssm=is_hybrid_ssm,
         sliding_window_size=sliding_window_size,
-        swa_recompute_config=swa_recompute_config,
         full_tokens_per_layer=full_tokens_per_layer,
         swa_tokens_per_layer=swa_tokens_per_layer,
         req_to_token_pool=req_to_token_pool,

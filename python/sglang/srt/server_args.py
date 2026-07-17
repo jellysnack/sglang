@@ -2174,6 +2174,7 @@ class ServerArgs:
         Optional[str],
         "A dictionary in JSON string format, or a string starting with a leading '@' and a config file in JSON/YAML/TOML format, containing extra configuration for the storage backend.",
     ] = None
+
     # -------------------------------------------------------------------------
     # Hierarchical sparse attention
     # -------------------------------------------------------------------------
@@ -6183,11 +6184,16 @@ class ServerArgs:
             raise ValueError(
                 "SGLANG_OPT_SWA_RECOMPUTE_WINDOW=1 requires a hybrid SWA model."
             )
-        if not getattr(model_config, "is_deepseek_v4_arch", False):
+        if not model_config.is_deepseek_v4_arch:
             raise ValueError(
                 "SGLANG_OPT_SWA_RECOMPUTE_WINDOW is only supported on the "
                 "DeepSeek V4 architecture. Got "
                 f"architectures={model_config.hf_config.architectures}."
+            )
+        if is_hip():
+            raise ValueError(
+                "SGLANG_OPT_SWA_RECOMPUTE_WINDOW is not supported on the "
+                "DeepSeek V4 HIP radix attention backend yet."
             )
         if config.speculative_algorithm is not None:
             raise ValueError(

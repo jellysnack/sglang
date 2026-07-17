@@ -24,11 +24,12 @@ from sglang.srt.observability.metrics_collector import (
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.mem_cache.radix_cache import RadixKey
     from sglang.srt.mem_cache.unified_cache_components.tree_component import (
         ComponentType,
     )
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 @runtime_checkable
@@ -37,6 +38,36 @@ class PrefixCacheTrait(Protocol):
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     page_size: int
     disable: bool
+
+
+class PendingCacheUpdate(Protocol):
+    """Cache-owned batch transformation committed after a successful forward."""
+
+    is_pending: bool
+    extra_compute_lens: list[int]
+
+    def prepare_inputs(self, reqs: list[Req]) -> tuple[list[object], list[int]]: ...
+
+    def validate_request(self, req: Req, wants_input_logprobs: bool) -> None: ...
+
+    def allocate(
+        self, batch: ScheduleBatch
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]: ...
+
+    def split_cached_tokens_by_source(
+        self,
+        req_index: int,
+        *,
+        pre_len: int,
+        host_hit_length: int,
+        storage_hit_length: int,
+    ) -> tuple[int, int, int]: ...
+
+    def apply_forward_metadata(self, forward_batch: ForwardBatch) -> None: ...
+
+    def commit(self, batch: ScheduleBatch) -> None: ...
+
+    def abort(self, batch: ScheduleBatch) -> None: ...
 
 
 @dataclasses.dataclass
@@ -111,11 +142,9 @@ class IncLockRefResult:
     skip_lock_node_ids: dict[ComponentType, set[int]] = dataclasses.field(
         default_factory=dict
     )
-    # SWA-window recompute: True iff inc_lock_ref skipped the SWA walk. The
-    # matching dec_lock_ref must skip SWA symmetrically. Propagated through
-    # to_dec_params; long-lived per-req locks mirror it onto
-    # req.swa_prefix_lock_released.
-    swa_skipped: bool = False
+    # Components intentionally excluded from this acquisition. Release must
+    # replay the same set even if their cache state changes in the meantime.
+    skipped_components: set[ComponentType] = dataclasses.field(default_factory=set)
 
     def to_dec_params(self) -> DecLockRefParams:
         """Convert to the corresponding DecLockRefParams for dec_lock_ref."""
@@ -126,7 +155,7 @@ class IncLockRefResult:
                 component_type: set(node_ids)
                 for component_type, node_ids in self.skip_lock_node_ids.items()
             },
-            swa_skipped=self.swa_skipped,
+            skipped_components=set(self.skipped_components),
         )
 
 
@@ -139,8 +168,7 @@ class DecLockRefParams:
     skip_lock_node_ids: dict[ComponentType, set[int]] = dataclasses.field(
         default_factory=dict
     )
-    # See IncLockRefResult.swa_skipped. dec_lock_ref treats this as skip_swa=True.
-    swa_skipped: bool = False
+    skipped_components: set[ComponentType] = dataclasses.field(default_factory=set)
 
 
 @dataclasses.dataclass
@@ -185,11 +213,9 @@ class MatchResult(NamedTuple):
         mamba_branching_seqlen: The mamba radix cache branching point, which is the longest
                                 page-aligned position that could've been cache hit if there
                                 exists a mamba state.
-        swa_recompute_len: Number of trailing matched tokens whose SWA KV was
-                                tombstoned while FULL + compressed KV stay alive.
-                                Under SWA-window recompute the match extends across
-                                these tombstones and the scheduler recomputes just
-                                this trailing window. 0 = no recompute needed.
+        extra_compute_prefix_len: Number of trailing matched prefix tokens that
+                                  must be included in the physical forward.
+                                  0 means no extra prefix compute is needed.
     """
 
     device_indices: torch.Tensor
@@ -201,7 +227,7 @@ class MatchResult(NamedTuple):
     mamba_host_hit_length: int = 0
     mamba_branching_seqlen: Optional[int] = None
     cache_protected_len: Optional[int] = None
-    swa_recompute_len: int = 0
+    extra_compute_prefix_len: int = 0
 
 
 def zero_match_result(tree_cache, match_result: MatchResult) -> MatchResult:
@@ -219,7 +245,7 @@ def zero_match_result(tree_cache, match_result: MatchResult) -> MatchResult:
         host_hit_length=0,
         swa_host_hit_length=0,
         mamba_host_hit_length=0,
-        swa_recompute_len=0,
+        extra_compute_prefix_len=0,
     )
 
 
@@ -262,6 +288,19 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def supports_fast_match_prefix(self) -> bool:
         return False
 
+    def create_pending_cache_update(
+        self, batch: ScheduleBatch
+    ) -> Optional[PendingCacheUpdate]:
+        return None
+
+    def resolve_extra_compute_prefix(self, req: Req) -> tuple[int, bool]:
+        extra_compute_len = max(0, req.extra_compute_prefix_len)
+        if extra_compute_len > len(req.prefix_indices):
+            raise AssertionError(
+                f"{type(self).__name__} cannot compute beyond the loaded prefix"
+            )
+        return extra_compute_len, False
+
     @abstractmethod
     def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs):
         pass
@@ -277,6 +316,15 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     @abstractmethod
     def inc_lock_ref(self, node: Any) -> IncLockRefResult:
         pass
+
+    def inc_lock_ref_excluding_components(
+        self, node: Any, skipped_components: set[ComponentType]
+    ) -> IncLockRefResult:
+        if skipped_components:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support partial component locks"
+            )
+        return self.inc_lock_ref(node)
 
     @abstractmethod
     def dec_lock_ref(
