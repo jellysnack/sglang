@@ -4308,6 +4308,8 @@ class TestUnifiedSWARecompute(UnifiedRadixCacheTestMixin, CustomTestCase):
             with self.subTest(state=state):
                 tree, _, _, seq, leaf = self._build_inserted(3)
                 if state == "host_tail":
+                    tree.cache_controller = mock.Mock()
+                    tree.components[ComponentType.SWA]._swa_kv_pool_host = mock.Mock()
                     full_data = leaf.component_data[ComponentType.FULL]
                     swa_data = leaf.component_data[ComponentType.SWA]
                     full_data.host_value = full_data.value.clone()
@@ -4333,6 +4335,50 @@ class TestUnifiedSWARecompute(UnifiedRadixCacheTestMixin, CustomTestCase):
                     self.assertGreater(result.swa_host_hit_length, 0)
                 else:
                     self.assertEqual(len(result.device_indices), len(seq))
+
+    def test_host_only_swa_tail_stays_out_of_device_prefix_on_load_back_failure(
+        self,
+    ):
+        tree, _, req_to_token_pool, seq, leaf = self._build_inserted(3)
+        swa = tree.components[ComponentType.SWA]
+
+        # Distinguish a host-backed SWA family from unified_kv's device-only ring.
+        tree.cache_controller = mock.Mock()
+        swa._swa_kv_pool_host = mock.Mock()
+
+        swa_data = leaf.component_data[ComponentType.SWA]
+        swa_data.host_value = swa_data.value.clone()
+        tree._evict_component_and_detach_lru(
+            leaf,
+            swa,
+            target=EvictLayer.DEVICE,
+        )
+
+        with envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.override(True):
+            result = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+
+        self.assertEqual(result.extra_compute_prefix_len, 0)
+        self.assertIs(result.best_match_node, leaf)
+        self.assertIs(result.last_device_node, leaf.parent)
+        safe_prefix_len = len(seq) - len(leaf.key)
+        self.assertEqual(len(result.device_indices), safe_prefix_len)
+        self.assertGreater(result.swa_host_hit_length, 0)
+
+        req = self._make_req(req_to_token_pool)
+        self._apply_match_to_req(req, result)
+        req.extra_compute_prefix_len = result.extra_compute_prefix_len
+        with mock.patch.object(tree, "load_back", return_value=False):
+            new_indices, last_node = tree.init_load_back(
+                InitLoadBackParams(
+                    best_match_node=req.best_match_node,
+                    host_hit_length=req.host_hit_length,
+                    req=req,
+                )
+            )
+
+        self.assertEqual(new_indices.numel(), 0)
+        self.assertIs(last_node, leaf.parent)
+        self.assertEqual(len(req.prefix_indices), safe_prefix_len)
 
     def test_missing_swa_tail_above_gate_arms_recompute(self):
         tree, _, _, seq, leaf = self._build_inserted(5)
@@ -4388,6 +4434,25 @@ class TestUnifiedSWARecompute(UnifiedRadixCacheTestMixin, CustomTestCase):
             swa.build_hicache_transfers(leaf, CacheTransferPhase.LOAD_BACK, req=req)
         )
 
+    def test_generic_lock_does_not_implicitly_exclude_swa(self):
+        tree, _, _, _, leaf = self._build_inserted(2)
+        tree._evict_component_and_detach_lru(
+            leaf,
+            tree.components[ComponentType.SWA],
+            target=EvictLayer.DEVICE,
+        )
+
+        with envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.override(True):
+            lock_result = tree.inc_lock_ref(leaf)
+
+        self.assertNotIn(ComponentType.SWA, lock_result.skipped_components)
+        self.assertIn(
+            leaf.id,
+            lock_result.skip_lock_node_ids.get(ComponentType.SWA, set()),
+        )
+        tree.dec_lock_ref(leaf, lock_result.to_dec_params())
+        tree.sanity_check()
+
     def test_complete_recompute_materializes_tail_and_upgrades_lock(self):
         tree, allocator, req_to_token_pool, seq, leaf = self._build_inserted(2)
         full_data = leaf.component_data[ComponentType.FULL]
@@ -4407,12 +4472,12 @@ class TestUnifiedSWARecompute(UnifiedRadixCacheTestMixin, CustomTestCase):
         self.assertIsNotNone(fresh_swa)
         allocator.commit_fresh_swa_for_recompute_window(full_data.value, fresh_swa)
 
-        lock_result = tree.inc_lock_ref_excluding_components(leaf, {ComponentType.SWA})
         req = self._make_req(req_to_token_pool)
         req.last_node = leaf
-        req.swa_prefix_lock_released = (
-            ComponentType.SWA in lock_result.skipped_components
-        )
+        req.extra_compute_prefix_len = len(seq)
+        lock_result = tree.inc_request_lock_ref(req)
+        self.assertIn(ComponentType.SWA, lock_result.skipped_components)
+        self.assertTrue(req.swa_prefix_lock_released)
         tree.complete_swa_recompute_lock(req, len(seq))
 
         self.assertGreater(full_data.lock_ref, 0)

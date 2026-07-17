@@ -5,7 +5,6 @@ from array import array
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
-from sglang.srt.mem_cache.unified_cache_components import ComponentType
 from sglang.srt.utils import get_bool_env_var
 
 _ROUTING_KEY_POLICY_DEBUG_LOG = get_bool_env_var("SGLANG_ROUTING_KEY_POLICY_DEBUG_LOG")
@@ -778,16 +777,11 @@ class PrefillAdder:
         )
 
     def _req_inc_lock_ref(self, req: Req):
-        result = self.tree_cache.inc_lock_ref_excluding_components(
-            req.last_node,
-            self._prefix_lock_exclusions(req),
-        )
+        if self.is_hybrid_swa:
+            req.swa_prefix_lock_released = False
+        result = self.tree_cache.inc_request_lock_ref(req)
         if self.is_hybrid_swa:
             req.swa_uuid_for_lock = result.swa_uuid_for_lock
-            # Mirror SWA-skipped locks so dec_lock_ref stays symmetric.
-            req.swa_prefix_lock_released = (
-                ComponentType.SWA in result.skipped_components
-            )
 
     def add_dllm_staging_req(self, req: Req):
         assert self.dllm_config is not None
@@ -871,21 +865,13 @@ class PrefillAdder:
         # Return if chunked prefill not finished
         return req if truncated else None
 
-    def _prefix_lock_exclusions(self, req: Req) -> set[ComponentType]:
-        if self.is_hybrid_swa and req.extra_compute_prefix_len > 0:
-            return {ComponentType.SWA}
-        return set()
-
     @contextmanager
-    def _lock_node(
-        self,
-        last_node: TreeNode,
-        skipped_components: Optional[set[ComponentType]] = None,
-    ):
+    def _lock_node(self, req: Req):
+        last_node = req.last_node
         dec_lock_params = None
         try:
             result = self.tree_cache.inc_lock_ref_excluding_components(
-                last_node, skipped_components or set()
+                last_node, self.tree_cache.prefix_lock_exclusions(req)
             )
             if self.tree_cache.is_tree_cache():
                 # init_load_back may revive SWA/Mamba tombstones while this
@@ -1060,10 +1046,14 @@ class PrefillAdder:
         # `total_tokens` so both `rem_total_tokens` gates reflect the joint budget.
         total_tokens += self._mamba_gap_budget_for_req(req)
 
-        # adjusting the input_tokens based on host_hit_length and page_size
         extra_compute_len = max(0, req.extra_compute_prefix_len)
         real_input_tokens = max(0, cand_extend_input_len - req.host_hit_length)
         real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
+        # Extra prefix compute reuses FULL host hits after load-back; ordinary
+        # hybrid-SWA requests retain the existing conservative budget.
+        swa_input_tokens = (
+            real_input_tokens if extra_compute_len > 0 else cand_extend_input_len
+        )
         prefix_len = len(req.prefix_indices)
 
         if total_tokens >= self.rem_total_tokens:
@@ -1071,7 +1061,7 @@ class PrefillAdder:
 
         if self.is_hybrid_swa:
             swa_needed = self._swa_budget_for_req(
-                real_input_tokens,
+                swa_input_tokens,
                 swa_host_hit_length=req.swa_host_hit_length,
                 extra_compute_prefix_len=extra_compute_len,
             )
@@ -1088,17 +1078,14 @@ class PrefillAdder:
             # - if the can_run_list is empty, always accept the first prefill request
             return AddReqResult.OTHER
 
-        with self._lock_node(
-            req.last_node,
-            skipped_components=self._prefix_lock_exclusions(req),
-        ):
+        with self._lock_node(req):
             # self.rem_total_tokens may decrease after the lock acquisition
             if total_tokens >= self.rem_total_tokens:
                 return AddReqResult.NO_TOKEN
 
             if self.is_hybrid_swa:
                 swa_needed = self._swa_budget_for_req(
-                    real_input_tokens,
+                    swa_input_tokens,
                     swa_host_hit_length=req.swa_host_hit_length,
                     extra_compute_prefix_len=extra_compute_len,
                 )

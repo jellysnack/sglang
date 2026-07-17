@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import dataclasses
 import math
 from typing import TYPE_CHECKING, Optional
 
+import msgspec
 import torch
 
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
@@ -20,8 +20,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
-@dataclasses.dataclass(frozen=True, slots=True)
-class SWARecomputeConfig:
+class SWARecomputeConfig(msgspec.Struct, frozen=True):
     """Model-specific sizing parameters for SWA-window recompute."""
 
     window_size: int
@@ -111,23 +110,21 @@ def resolve_swa_recompute_prefix(
     return 0, True
 
 
-@dataclasses.dataclass
-class _SWARecomputeTxn:
+class _SWARecomputeTxn(msgspec.Struct):
     req: Req
     recompute_len: int
     full_indices: torch.Tensor
     fresh_swa_indices: torch.Tensor
 
 
-@dataclasses.dataclass
-class SWARecomputeBatchState:
+class SWARecomputeBatchState(msgspec.Struct):
     """Own the private-page transaction for one SWA recompute forward."""
 
     extra_compute_lens: list[int]
     logical_prefix_lens: list[int]
     is_pending: bool = True
     out_cache_loc_override: Optional[torch.Tensor] = None
-    txns: list[_SWARecomputeTxn] = dataclasses.field(default_factory=list)
+    txns: list[_SWARecomputeTxn] = []
 
     @classmethod
     def create_if_needed(cls, batch: ScheduleBatch) -> Optional[SWARecomputeBatchState]:

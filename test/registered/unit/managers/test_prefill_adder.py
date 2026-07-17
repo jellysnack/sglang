@@ -50,6 +50,18 @@ class TestPrefillAdder(CustomTestCase):
                 skipped_components=set(skipped_components)
             )
         )
+        tree_cache.prefix_lock_exclusions.side_effect = lambda req: (
+            {"swa"} if req.extra_compute_prefix_len > 0 else set()
+        )
+
+        def inc_request_lock_ref(req):
+            result = tree_cache.inc_lock_ref_excluding_components(
+                req.last_node, tree_cache.prefix_lock_exclusions(req)
+            )
+            req.swa_prefix_lock_released = bool(result.skipped_components)
+            return result
+
+        tree_cache.inc_request_lock_ref.side_effect = inc_request_lock_ref
         tree_cache.dec_lock_ref.return_value = DecLockRefResult()
         tree_cache.is_tree_cache.return_value = False
         tree_cache.supports_mamba.return_value = False
@@ -647,36 +659,50 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(req.host_hit_length, 0)
         self.assertEqual(adder.can_run_list, [req])
 
-    def test_swa_budget_excludes_full_host_hit_before_load_back(self):
+    def test_swa_budget_excludes_full_host_hit_only_for_extra_compute(self):
         self.mock_token_allocator.full_available_size.return_value = 100_000
         self.mock_token_allocator.swa_available_size.return_value = 200
         self.mock_token_allocator.available_size.return_value = 100_000
         self.mock_tree_cache.sliding_window_size = 128
-        adder = self.create_adder(self.create_running_batch(), page_size=16)
-        adder.is_hybrid_swa = True
-
         host_hit = 896
-        req = self._make_tensor_prefill_req(
-            rid="host-hit-budget",
-            prefix_len=512,
-            extend_input_len=host_hit + 64,
-            host_hit_length=host_hit,
-            swa_recompute_len=96,
-        )
-        self.mock_tree_cache.init_load_back.return_value = (
-            torch.arange(host_hit, dtype=torch.int64),
-            req.best_match_node,
-        )
+        for extra_compute_len, expected in (
+            (0, AddReqResult.NO_TOKEN),
+            (96, AddReqResult.CONTINUE),
+        ):
+            with self.subTest(extra_compute_len=extra_compute_len):
+                adder = self.create_adder(self.create_running_batch(), page_size=16)
+                adder.is_hybrid_swa = True
+                req = self._make_tensor_prefill_req(
+                    rid=f"host-hit-budget-{extra_compute_len}",
+                    prefix_len=512,
+                    extend_input_len=host_hit + 64,
+                    host_hit_length=host_hit,
+                    swa_recompute_len=extra_compute_len,
+                )
+                self.mock_tree_cache.init_load_back.reset_mock()
+                self.mock_tree_cache.init_load_back.return_value = (
+                    torch.arange(host_hit, dtype=torch.int64),
+                    req.best_match_node,
+                )
 
-        result = adder.add_one_req(
-            req, has_chunked_req=False, truncation_align_size=None
-        )
+                result = adder.add_one_req(
+                    req, has_chunked_req=False, truncation_align_size=None
+                )
 
-        self.assertEqual(result, AddReqResult.CONTINUE)
-        self.assertEqual(req.extra_compute_prefix_len, 96)
-        self.assertEqual(req.extend_range, Range(512 + host_hit, 512 + host_hit + 64))
-        self.assertEqual(len(req.prefix_indices), 512 + host_hit)
-        self.assertEqual(adder.can_run_list, [req])
+                self.assertEqual(result, expected)
+                self.assertEqual(
+                    self.mock_tree_cache.init_load_back.called,
+                    extra_compute_len > 0,
+                )
+
+                if extra_compute_len > 0:
+                    self.assertEqual(req.extra_compute_prefix_len, extra_compute_len)
+                    self.assertEqual(
+                        req.extend_range,
+                        Range(512 + host_hit, 512 + host_hit + 64),
+                    )
+                    self.assertEqual(len(req.prefix_indices), 512 + host_hit)
+                    self.assertEqual(adder.can_run_list, [req])
 
     def test_swa_recompute_mixed_batch_allowed(self):
         self.mock_token_allocator.full_available_size.return_value = 100_000

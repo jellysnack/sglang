@@ -88,6 +88,21 @@ C4_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
 
 
+def _should_use_sparse_prefill(
+    num_query_tokens: int, forward_batch: ForwardBatch
+) -> bool:
+    # SparsePrefillChunkCache uses global request ranges, which cannot index
+    # query rows after context parallelism has sharded them across ranks.
+    return (
+        forward_batch.attn_cp_metadata is None
+        and forward_batch.forward_mode.is_extend_without_speculative()
+        and (
+            num_query_tokens > _LARGE_INDEXER_QUERY_THRESHOLD
+            or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
+        )
+    )
+
+
 def _get_logical_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
     # IDLE is a real per-DP-rank mode. Do not let a stale _original_forward_mode
     # from a reused/padded ForwardBatch turn an empty rank into TARGET_VERIFY.
@@ -1692,10 +1707,7 @@ class DeepseekV4AttnBackend(
                     extra_indices.shape[-1] % 64 == 0
                 ), f"{extra_indices.shape=}'s last dimension is not aligned to 64"
 
-            if forward_batch.forward_mode.is_extend_without_speculative() and (
-                q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
-                or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
-            ):
+            if _should_use_sparse_prefill(q.shape[0], forward_batch):
                 return self._forward_prefill_sparse(
                     q=q,
                     layer_id=layer_id,

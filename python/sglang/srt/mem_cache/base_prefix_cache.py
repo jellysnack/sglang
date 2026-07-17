@@ -326,6 +326,16 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
             )
         return self.inc_lock_ref(node)
 
+    def prefix_lock_exclusions(self, req: Req) -> set[ComponentType]:
+        """Components this cache excludes from a request's prefix lock."""
+        return set()
+
+    def inc_request_lock_ref(self, req: Req) -> IncLockRefResult:
+        """Acquire the cache-selected prefix lock for a request."""
+        return self.inc_lock_ref_excluding_components(
+            req.last_node, self.prefix_lock_exclusions(req)
+        )
+
     @abstractmethod
     def dec_lock_ref(
         self, node: Any, params: Optional[DecLockRefParams] = None

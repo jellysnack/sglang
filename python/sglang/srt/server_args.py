@@ -6195,6 +6195,11 @@ class ServerArgs:
                 "SGLANG_OPT_SWA_RECOMPUTE_WINDOW is not supported on the "
                 "DeepSeek V4 HIP radix attention backend yet."
             )
+        if is_npu():
+            raise ValueError(
+                "SGLANG_OPT_SWA_RECOMPUTE_WINDOW is not supported by the "
+                "DeepSeek V4 NPU allocator yet."
+            )
         if config.speculative_algorithm is not None:
             raise ValueError(
                 "SGLANG_OPT_SWA_RECOMPUTE_WINDOW is not supported with "

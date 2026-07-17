@@ -6,11 +6,11 @@ import threading
 import time
 from array import array
 from collections import defaultdict
-from dataclasses import dataclass
 from functools import partial
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any, Iterator, NamedTuple, Optional, TypeVar
 
+import msgspec
 import torch
 
 from sglang.srt.disaggregation.kv_events import StorageMedium
@@ -143,14 +143,12 @@ class UnifiedTreeNode:
         return node.get_prefix_hash_values(node.parent) + node.hash_value
 
 
-@dataclass(frozen=True)
-class _FullPrefixMatchSegment:
+class _FullPrefixMatchSegment(msgspec.Struct, frozen=True):
     node: UnifiedTreeNode
     length: int
 
 
-@dataclass(frozen=True)
-class _FullPrefixWalkResult:
+class _FullPrefixWalkResult(msgspec.Struct, frozen=True):
     last_node: UnifiedTreeNode
     segments: tuple[_FullPrefixMatchSegment, ...]
 
@@ -611,7 +609,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if len(key) == 0:
             return self._empty_match_result
 
-        # Recompute path returns -1 when the length gate wants legacy matching.
+        # Only an armed recompute may bypass component device validators. A live
+        # or host-backed SWA tail still needs legacy matching for a safe anchor.
         if (
             envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.get()
             and ComponentType.SWA in self.components
@@ -624,7 +623,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 best_match_device_value_len,
                 swa_recompute_len,
             ) = self._match_prefix_helper_recompute(walk_result)
-            if swa_recompute_len >= 0:
+            if swa_recompute_len > 0:
                 return self._match_post_processor(
                     params,
                     value,
@@ -732,8 +731,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         return revived
 
-    def _should_skip_swa_for_recompute(self, node: Any) -> bool:
-        """Skip SWA locking when the regular SWA window has a tombstone."""
+    def _has_swa_recompute_tombstone_in_window(self, node: Any) -> bool:
+        """Return whether the trailing SWA window contains a tombstone."""
         swa = self.components.get(ComponentType.SWA)
         if swa is None or not envs.SGLANG_OPT_SWA_RECOMPUTE_WINDOW.get():
             return False
@@ -749,16 +748,26 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         return False
 
     def inc_lock_ref(self, node: Any) -> IncLockRefResult:
-        skipped_components = (
-            {ComponentType.SWA} if self._should_skip_swa_for_recompute(node) else set()
-        )
-        return self._inc_lock_ref_impl(node, skipped_components=skipped_components)
+        return self._inc_lock_ref_impl(node)
 
     def inc_lock_ref_excluding_components(
         self, node: Any, skipped_components: set[ComponentType]
     ) -> IncLockRefResult:
         """Acquire a composite lock while excluding selected components."""
         return self._inc_lock_ref_impl(node, skipped_components=set(skipped_components))
+
+    def prefix_lock_exclusions(self, req: Req) -> set[ComponentType]:
+        if ComponentType.SWA in self.components and req.extra_compute_prefix_len > 0:
+            return {ComponentType.SWA}
+        return set()
+
+    def inc_request_lock_ref(self, req: Req) -> IncLockRefResult:
+        result = super().inc_request_lock_ref(req)
+        if ComponentType.SWA in self.components:
+            req.swa_prefix_lock_released = (
+                ComponentType.SWA in result.skipped_components
+            )
+        return result
 
     def _inc_lock_ref_impl(
         self,
@@ -844,13 +853,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def inc_host_lock_ref(self, node: Any) -> IncLockRefResult:
         if self.disable:
             return IncLockRefResult()
-        skip_swa = self._should_skip_swa_for_recompute(node)
-        result = IncLockRefResult(
-            skipped_components={ComponentType.SWA} if skip_swa else set()
-        )
+        result = IncLockRefResult()
         for component in self._components_tuple:
-            if skip_swa and component.component_type == ComponentType.SWA:
-                continue
             result = component.acquire_component_lock(
                 node=node, result=result, lock_host=True
             )
@@ -1039,7 +1043,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 ),
             ),
         )
-        if chunked and self._should_skip_swa_for_recompute(new_last_node):
+        if chunked and self._has_swa_recompute_tombstone_in_window(new_last_node):
             raise AssertionError(
                 "cache_unfinished_req(chunked=True) found a missing SWA page "
                 "inside the current sliding window after stashing a chunk. "

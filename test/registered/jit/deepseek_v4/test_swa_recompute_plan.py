@@ -25,6 +25,15 @@ def _count_valid(plan: torch.Tensor) -> int:
     return int((head != -1).sum().item())
 
 
+def _valid_plan_rows(plan: torch.Tensor) -> torch.Tensor:
+    rows = plan.contiguous().cpu().view(torch.int32)
+    return rows[rows[:, 0] != -1]
+
+
+def _compute_state_loc(swa_loc: int, *, ring_size: int) -> int:
+    return (swa_loc // PAGE) * ring_size + swa_loc % ring_size
+
+
 @pytest.mark.parametrize("compress_ratio", [4, 128])
 def test_default_boundary_is_byte_identical(compress_ratio: int) -> None:
     seq_extend = [(2 * PAGE, PAGE), (3 * PAGE, PAGE)]
@@ -123,6 +132,65 @@ def test_boundary_device_must_match_seq_lens() -> None:
             extend_lens_cpu,
             num_q,
             recompute_boundary=boundary,
+        )
+
+
+def test_prefill1_uses_override_for_current_extend_reads_and_writes() -> None:
+    compress_ratio = 4
+    seq_extend = [(16, 8), (19, 8)]
+    ctx = make_paged_context(
+        bs=len(seq_extend), compress_ratio=compress_ratio, head_dim=HEAD_DIM
+    )
+    seq_lens_cpu, extend_lens_cpu, num_q = to_seq_extend(seq_extend)
+    extend_start_loc = torch.tensor([0, 8], dtype=torch.int32, device="cuda")
+    override = 300 + 9 * torch.arange(num_q, dtype=torch.int32, device="cuda")
+
+    plan = ctx.make_prefill_plan(
+        seq_lens_cpu,
+        extend_lens_cpu,
+        num_q,
+        swa_out_cache_loc_override=override,
+        extend_start_loc=extend_start_loc,
+    )
+
+    plan_c_by_ragged = {
+        int(row[1].item()) & 0xFFFF: row for row in _valid_plan_rows(plan.plan_c)
+    }
+
+    # Request 0 compresses at local_j == cr - 1, so read_page_0 still comes
+    # from the persistent mapping while read_page_1 uses the current override.
+    before_boundary = plan_c_by_ragged[compress_ratio - 1]
+    assert int(before_boundary[2].item()) == ctx.state_loc(0, 7) // compress_ratio
+    assert (
+        int(before_boundary[3].item())
+        == _compute_state_loc(
+            int(override[compress_ratio - 1].item()), ring_size=ctx.ring_size
+        )
+        // compress_ratio
+    )
+
+    # Request 1 compresses at local_j == cr, so both endpoints of the read
+    # window are already in its private override range.
+    at_boundary_ragged = int(extend_start_loc[1].item()) + compress_ratio
+    at_boundary = plan_c_by_ragged[at_boundary_ragged]
+    assert (
+        int(at_boundary[2].item())
+        == _compute_state_loc(
+            int(override[extend_start_loc[1]].item()), ring_size=ctx.ring_size
+        )
+        // compress_ratio
+    )
+    assert (
+        int(at_boundary[3].item())
+        == _compute_state_loc(
+            int(override[at_boundary_ragged].item()), ring_size=ctx.ring_size
+        )
+        // compress_ratio
+    )
+
+    for ragged_id, write_loc in _valid_plan_rows(plan.plan_w).tolist():
+        assert write_loc == _compute_state_loc(
+            int(override[ragged_id].item()), ring_size=ctx.ring_size
         )
 
 
