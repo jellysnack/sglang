@@ -1016,6 +1016,7 @@ class Scheduler(
             _,
             _,
             _,
+            self.max_req_token_capacity,
         ) = self.tp_worker.get_worker_info()
         # DFlash auto-enables the legacy formula; other workloads opt in via
         # --min-free-slots-delay. Built independently of the prefill delayer.
@@ -2123,18 +2124,25 @@ class Scheduler(
                 )
             max_new_tokens = min(max_new_tokens, self.max_new_tokens_limit)
 
+        generation_token_capacity = (
+            self.max_req_token_capacity
+            if self.enable_hisparse
+            and self.disaggregation_mode == DisaggregationMode.DECODE
+            else self.max_total_num_tokens * self.server_args.dcp_size
+        )
+
         # Keep this bound consistent with PrefillAdder's admission budget:
         # ceil_page(input_len) + max_new_tokens + page_size must be strictly
-        # smaller than max_total_num_tokens. Otherwise a request can be accepted
-        # into the waiting queue but can never be scheduled, blocking the queue
-        # and eventually making health checks fail.
+        # smaller than the per-request token capacity. HiSparse decode uses its
+        # logical capacity here; max_total_num_tokens remains the physical pool
+        # capacity used for device-buffer and parallelism accounting.
         paged_input_len = -(-input_len // self.page_size) * self.page_size
         req.sampling_params.max_new_tokens = max(
             0,
             min(
                 max_new_tokens,
                 self.max_req_len - input_len - 1,
-                self.max_total_num_tokens * self.server_args.dcp_size
+                generation_token_capacity
                 - paged_input_len
                 - self.page_size
                 - 1,

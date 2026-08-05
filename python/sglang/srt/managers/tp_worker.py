@@ -506,11 +506,13 @@ class TpModelWorker(BaseTpWorker):
         self.model_runner.hisparse_coordinator = coordinator
 
     def get_worker_info(self):
-        max_req_len = min(
-            self.model_config.context_len - 1,
+        max_req_token_capacity = (
             self.model_runner.effective_max_total_num_tokens
             * self.model_runner.dcp_size
-            - 1,
+        )
+        max_req_len = min(
+            self.model_config.context_len - 1,
+            max_req_token_capacity - 1,
         )
         return (
             self.model_runner.max_total_num_tokens,
@@ -525,6 +527,7 @@ class TpModelWorker(BaseTpWorker):
             self.model_runner.req_to_token_pool.size,
             self.model_runner.req_to_token_pool.max_context_len,
             self.model_runner.token_to_kv_pool.size,
+            max_req_token_capacity,
         )
 
     def is_dllm(self):
